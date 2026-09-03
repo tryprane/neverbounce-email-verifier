@@ -75,7 +75,15 @@ class SessionManager:
             extracted.update(res)
 
         try:
-            StealthyFetcher.fetch(NEVERBOUNCE_HOME, page_action=extract_action, headless=True, timeout=25000)
+            StealthyFetcher.fetch(
+                NEVERBOUNCE_HOME,
+                page_action=extract_action,
+                headless=True,
+                disable_resources=True,
+                network_idle=False,
+                retries=1,
+                timeout=25000,
+            )
             cookie_str = extracted.get("cookies", "")
             if "_pxhd" in cookie_str:
                 self.cached_cookie = cookie_str
@@ -250,6 +258,9 @@ class NeverbounceVerifier:
         fetch_kwargs: Dict[str, Any] = {
             "page_action": on_page_action,
             "headless": True,
+            "disable_resources": True,
+            "network_idle": False,
+            "retries": 1,
             "timeout": 25000,
         }
         if self.proxy_url:

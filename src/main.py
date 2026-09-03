@@ -51,8 +51,9 @@ async def verify_email_with_retry(
         Actor.log.info(f"[{email}] Verification attempt {attempt}/{MAX_RETRIES_PER_EMAIL} (session: {last_session_id or 'default'})...")
 
         try:
-            verifier = NeverbounceVerifier(proxy_url=current_proxy, timeout_seconds=15)
-            res = await asyncio.to_thread(verifier.verify, email)
+            verifier = NeverbounceVerifier(proxy_url=current_proxy, timeout_seconds=12)
+            allow_fallback = (attempt == MAX_RETRIES_PER_EMAIL)
+            res = await asyncio.to_thread(verifier.verify, email, allow_stealth_fallback=allow_fallback)
 
             if res.get("success") and res.get("data"):
                 data = res["data"]

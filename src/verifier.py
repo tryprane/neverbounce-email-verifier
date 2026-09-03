@@ -48,14 +48,13 @@ class SessionManager:
         extracted: Dict[str, str] = {}
 
         def extract_action(page):
-            # Block heavy media and trackers to make local fetch instant (<1.5s)
             try:
                 page.route(
                     "**/*",
                     lambda route: (
                         route.abort()
-                        if route.request.resource_type in ["image", "media", "font"]
-                        or any(t in route.request.url for t in ["facebook", "googleads", "zoominfo", "datadog"])
+                        if route.request.resource_type in ["image", "media", "font", "stylesheet"]
+                        or any(t in route.request.url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"])
                         else route.continue_()
                     ),
                 )
@@ -110,7 +109,7 @@ class NeverbounceVerifier:
     Hybrid email verifier:
     - Browser session (_pxhd token) solved locally (0 proxy cost).
     - Email lookup sent via raw HTTP POST through Apify Residential Proxy (only ~1.5 KB per call).
-    - Automatic fallback to in-browser stealth execution if proxy requires full JS evaluation.
+    - Prioritizes fast session rotation over heavy browser fallback to protect proxy bandwidth.
     """
 
     def __init__(self, proxy_url: Optional[str] = None, timeout_seconds: int = 15):
@@ -171,7 +170,8 @@ class NeverbounceVerifier:
 
     def verify_stealth_fallback(self, email: str) -> Dict[str, Any]:
         """
-        Fallback: Full in-page execution via Scrapling if direct HTTP is challenged.
+        Fallback: Full in-page execution via Scrapling if direct HTTP is repeatedly challenged.
+        Blocks images, media, fonts, and stylesheets to keep bandwidth minimal.
         """
         clean_email = email.strip()
         result_holder: Dict[str, Any] = {
@@ -185,14 +185,14 @@ class NeverbounceVerifier:
 
         def on_page_action(page):
             try:
-                # Abort heavy tracking/images to protect proxy bandwidth
+                # Abort heavy tracking, stylesheets, and images to protect proxy bandwidth
                 try:
                     page.route(
                         "**/*",
                         lambda route: (
                             route.abort()
-                            if route.request.resource_type in ["image", "media", "font"]
-                            or any(t in route.request.url for t in ["facebook", "googleads", "zoominfo"])
+                            if route.request.resource_type in ["image", "media", "font", "stylesheet"]
+                            or any(t in route.request.url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"])
                             else route.continue_()
                         ),
                     )
@@ -250,11 +250,12 @@ class NeverbounceVerifier:
 
         return result_holder
 
-    def verify(self, email: str) -> Dict[str, Any]:
+    def verify(self, email: str, allow_stealth_fallback: bool = False) -> Dict[str, Any]:
         """
         Primary verification method:
         1. Attempts fast HTTP (~1.5 KB proxy bandwidth).
-        2. Falls back to stealth browser if required.
+        2. If challenged (403), refreshes session and retries fast HTTP.
+        3. Only engages stealth browser if explicitly permitted (on final retry).
         """
         # Attempt 1: Fast HTTP with transferred cookie
         fast_res = self.verify_fast_http(email)
@@ -267,10 +268,14 @@ class NeverbounceVerifier:
             fast_retry = self.verify_fast_http(email)
             if fast_retry.get("success"):
                 return fast_retry
+            return fast_retry
 
-        # If still failing or rate limited, fallback to stealth browser
+        # If rate limited (429), return immediately to rotate proxy session
         if fast_res.get("error") == "RATE_LIMITED_429":
             return fast_res
 
-        logger.info("Direct HTTP challenge encountered. Engaging stealth browser fallback...")
-        return self.verify_stealth_fallback(email)
+        if allow_stealth_fallback:
+            logger.info("All fast HTTP attempts challenged. Engaging lightweight stealth browser fallback...")
+            return self.verify_stealth_fallback(email)
+
+        return fast_res

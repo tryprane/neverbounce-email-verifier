@@ -61,6 +61,11 @@ class SessionManager:
             except Exception:
                 pass
 
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                time.sleep(3.0)
+
             res = page.evaluate(
                 """() => ({
                     cookies: document.cookie,
@@ -77,8 +82,11 @@ class SessionManager:
                 if extracted.get("userAgent"):
                     self.cached_user_agent = extracted["userAgent"]
                 self.last_solved_at = time.time()
+                print("[SessionManager] Successfully acquired authentic PerimeterX _pxhd cookie.")
                 logger.info("Successfully acquired PerimeterX session token.")
                 return True
+            else:
+                print(f"[SessionManager] Warning: _pxhd cookie not found in: {cookie_str[:100]}")
         except Exception as e:
             logger.warning("Session token acquisition encountered error: %s", e)
 
@@ -126,11 +134,15 @@ class NeverbounceVerifier:
 
         req = urllib.request.Request(NEVERBOUNCE_API, data=post_data, headers=headers)
 
+        import ssl
+        ctx = ssl._create_unverified_context()
+        https_handler = urllib.request.HTTPSHandler(context=ctx)
+
         if self.proxy_url:
             proxy_handler = urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-            opener = urllib.request.build_opener(proxy_handler)
+            opener = urllib.request.build_opener(proxy_handler, https_handler)
         else:
-            opener = urllib.request.build_opener()
+            opener = urllib.request.build_opener(https_handler)
 
         try:
             with opener.open(req, timeout=self.timeout) as resp:

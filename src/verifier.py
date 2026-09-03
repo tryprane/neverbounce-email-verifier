@@ -283,8 +283,6 @@ class NeverbounceVerifier:
             "retries": 1,
             "timeout": 25000,
         }
-        if self.proxy_url:
-            fetch_kwargs["proxy"] = self.proxy_url
 
         try:
             StealthyFetcher.fetch(NEVERBOUNCE_HOME, **fetch_kwargs)

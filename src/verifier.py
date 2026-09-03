@@ -238,7 +238,7 @@ class NeverbounceVerifier:
         fetch_kwargs: Dict[str, Any] = {
             "page_action": on_page_action,
             "headless": True,
-            "timeout": self.timeout * 1000,
+            "timeout": 25000,
         }
         if self.proxy_url:
             fetch_kwargs["proxy"] = self.proxy_url
@@ -253,29 +253,17 @@ class NeverbounceVerifier:
     def verify(self, email: str, allow_stealth_fallback: bool = False) -> Dict[str, Any]:
         """
         Primary verification method:
-        1. Attempts fast HTTP (~1.5 KB proxy bandwidth).
-        2. If challenged (403), refreshes session and retries fast HTTP.
-        3. Only engages stealth browser if explicitly permitted (on final retry).
+        1. Fast HTTP attempt (~1.5 KB proxy bandwidth, ~0.5s).
+        2. If challenged or rate-limited, returns fast_res immediately to let caller rotate proxy session.
+        3. Only engages lightweight stealth browser if allow_stealth_fallback=True (final attempt).
         """
-        # Attempt 1: Fast HTTP with transferred cookie
         fast_res = self.verify_fast_http(email)
         if fast_res.get("success"):
             return fast_res
 
-        # If token was expired or challenged, refresh session and retry once
-        if fast_res.get("status_code") == 403:
-            global_session.refresh_session()
-            fast_retry = self.verify_fast_http(email)
-            if fast_retry.get("success"):
-                return fast_retry
-            return fast_retry
-
-        # If rate limited (429), return immediately to rotate proxy session
-        if fast_res.get("error") == "RATE_LIMITED_429":
-            return fast_res
-
-        if allow_stealth_fallback:
-            logger.info("All fast HTTP attempts challenged. Engaging lightweight stealth browser fallback...")
+        # If challenged and fallback is allowed (final attempt), engage stealth browser
+        if allow_stealth_fallback and fast_res.get("status_code") in [403, 0]:
+            logger.info("[%s] Direct HTTP challenged. Engaging lightweight stealth fallback...", email)
             return self.verify_stealth_fallback(email)
 
         return fast_res

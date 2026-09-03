@@ -9,8 +9,8 @@ from apify import Actor
 
 from src.verifier import NeverbounceVerifier, validate_email, global_session
 
-MAX_RETRIES_PER_EMAIL = 4
-RETRY_BACKOFF_SECONDS = 1.2
+MAX_RETRIES_PER_EMAIL = 3
+RETRY_BACKOFF_SECONDS = 0.5
 
 
 def parse_flags(flags_list: List[str]) -> Dict[str, bool]:

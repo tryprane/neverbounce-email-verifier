@@ -1,0 +1,20 @@
+{
+  "actorSpecification": 1,
+  "name": "neverbounce-email-verifier",
+  "title": "NeverBounce Free Email Verifier",
+  "description": "Fast, high-reliability email verification powered by NeverBounce with automatic Apify Residential Proxy rotation, PerimeterX/Cloudflare bypass, and zero errors.",
+  "version": "1.0",
+  "meta": {
+    "templateId": "python-playwright"
+  },
+  "dockerfilePath": "Dockerfile",
+  "input": "./input_schema.json",
+  "output": "./output_schema.json",
+  "storages": {
+    "dataset": "./dataset_schema.json"
+  },
+  "defaultRunOptions": {
+    "memoryMbytes": 2048,
+    "timeoutSecs": 180
+  }
+}

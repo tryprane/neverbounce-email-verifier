@@ -1,0 +1,114 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "type": "object",
+    "properties": {
+      "email": {
+        "type": "string",
+        "description": "The queried email address."
+      },
+      "status": {
+        "type": ["string", "null"],
+        "description": "Verification status: valid, invalid, disposable, catch_all, unknown."
+      },
+      "is_valid": {
+        "type": "boolean",
+        "description": "True if status is valid."
+      },
+      "flags": {
+        "type": "array",
+        "description": "Deliverability and network verification flags.",
+        "items": {
+          "type": "string"
+        }
+      },
+      "free_email": {
+        "type": "boolean",
+        "description": "True if host is a free webmail provider (e.g. Gmail, Yahoo)."
+      },
+      "role_account": {
+        "type": "boolean",
+        "description": "True if email is a role/group mailbox (e.g. admin@, info@, support@)."
+      },
+      "smtp_connectable": {
+        "type": "boolean",
+        "description": "True if destination mail server accepted connection."
+      },
+      "has_dns": {
+        "type": "boolean",
+        "description": "True if domain has valid DNS records."
+      },
+      "has_dns_mx": {
+        "type": "boolean",
+        "description": "True if domain has active MX mail exchange records."
+      },
+      "historical_response": {
+        "type": "boolean",
+        "description": "True if verification was retrieved from NeverBounce historical cache database."
+      },
+      "proxy_session": {
+        "type": ["string", "null"],
+        "description": "Proxy session identifier used for the lookup."
+      },
+      "attempts": {
+        "type": "integer",
+        "description": "Number of retry attempts required."
+      },
+      "latency_seconds": {
+        "type": "number",
+        "description": "Total execution latency in seconds."
+      },
+      "error": {
+        "type": ["string", "null"],
+        "description": "Error details if verification failed."
+      }
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Verified Emails",
+      "transformation": {
+        "fields": [
+          "email",
+          "status",
+          "is_valid",
+          "historical_response",
+          "free_email",
+          "role_account",
+          "smtp_connectable",
+          "flags",
+          "latency_seconds"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "email": {
+            "label": "Email"
+          },
+          "status": {
+            "label": "Status"
+          },
+          "is_valid": {
+            "label": "Deliverable"
+          },
+          "historical_response": {
+            "label": "From History/Cache"
+          },
+          "free_email": {
+            "label": "Free Email"
+          },
+          "role_account": {
+            "label": "Role Account"
+          },
+          "smtp_connectable": {
+            "label": "SMTP Connectable"
+          },
+          "flags": {
+            "label": "Verification Flags"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "actorOutputSchemaVersion": 1,
+  "title": "NeverBounce Email Verification Output",
+  "properties": {
+    "overview": {
+      "title": "Results Overview",
+      "type": "string",
+      "template": "{{links.apiDefaultDatasetUrl}}/items"
+    }
+  }
+}

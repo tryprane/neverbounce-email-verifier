@@ -1,0 +1,29 @@
+{
+  "title": "NeverBounce Email Verifier Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "email": {
+      "title": "Email Address",
+      "type": "string",
+      "description": "Single email address to verify (e.g. support@neverbounce.com or satya@microsoft.com).",
+      "editor": "textfield",
+      "prefill": "support@neverbounce.com"
+    },
+    "emails": {
+      "title": "Email List (Batch)",
+      "type": "array",
+      "description": "Optional list of emails to verify in a single run.",
+      "editor": "stringList",
+      "items": {
+        "type": "string"
+      }
+    },
+    "proxy_url": {
+      "title": "Custom Residential Proxy URL (Optional)",
+      "type": "string",
+      "description": "Optional custom proxy URL (format: http://user:pass@host:port). If omitted, Apify Residential Proxy will be used automatically.",
+      "editor": "textfield"
+    }
+  }
+}

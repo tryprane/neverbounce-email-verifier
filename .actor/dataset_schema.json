@@ -46,6 +46,14 @@
         "type": "boolean",
         "description": "True if verification was retrieved from NeverBounce historical cache database."
       },
+      "verification_method": {
+        "type": ["string", "null"],
+        "description": "Execution method used: fast_http (~1.5KB bandwidth) or stealth_fallback."
+      },
+      "transfer_bytes": {
+        "type": "integer",
+        "description": "Bytes transferred over the proxy for this verification."
+      },
       "proxy_session": {
         "type": ["string", "null"],
         "description": "Proxy session identifier used for the lookup."
@@ -77,6 +85,7 @@
           "role_account",
           "smtp_connectable",
           "flags",
+          "verification_method",
           "latency_seconds"
         ]
       },
@@ -103,6 +112,9 @@
           },
           "smtp_connectable": {
             "label": "SMTP Connectable"
+          },
+          "verification_method": {
+            "label": "Method"
           },
           "flags": {
             "label": "Verification Flags"

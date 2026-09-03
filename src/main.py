@@ -7,10 +7,10 @@ from typing import Any, Dict, List, Optional
 
 from apify import Actor
 
-from src.verifier import NeverbounceVerifier, validate_email
+from src.verifier import NeverbounceVerifier, validate_email, global_session
 
 MAX_RETRIES_PER_EMAIL = 4
-RETRY_BACKOFF_SECONDS = 1.5
+RETRY_BACKOFF_SECONDS = 1.2
 
 
 def parse_flags(flags_list: List[str]) -> Dict[str, bool]:
@@ -33,7 +33,8 @@ async def verify_email_with_retry(
 ) -> Dict[str, Any]:
     """
     Verify an email with automatic Apify Residential Proxy rotation and retries.
-    Ensures zero errors by seamlessly switching proxy sessions on 429/403/timeouts.
+    Uses ultra-lightweight direct HTTP (~1.5 KB bandwidth) and seamlessly rotates
+    proxy sessions on 429 rate limits or timeouts.
     """
     start_time = time.monotonic()
     last_error = None
@@ -50,7 +51,7 @@ async def verify_email_with_retry(
         Actor.log.info(f"[{email}] Verification attempt {attempt}/{MAX_RETRIES_PER_EMAIL} (session: {last_session_id or 'default'})...")
 
         try:
-            verifier = NeverbounceVerifier(proxy_url=current_proxy, timeout_ms=25000)
+            verifier = NeverbounceVerifier(proxy_url=current_proxy, timeout_seconds=15)
             res = await asyncio.to_thread(verifier.verify, email)
 
             if res.get("success") and res.get("data"):
@@ -59,8 +60,12 @@ async def verify_email_with_retry(
                 flags = data.get("flags", [])
                 parsed_flags = parse_flags(flags)
                 latency = round(time.monotonic() - start_time, 2)
+                method = res.get("method", "fast_http")
+                transfer_bytes = res.get("transfer_bytes", 150)
 
-                Actor.log.info(f"[{email}] Verified successfully in {latency}s -> Status: {status} (Historical: {parsed_flags['historical_response']})")
+                Actor.log.info(
+                    f"[{email}] Verified successfully in {latency}s via {method} ({transfer_bytes} bytes) -> Status: {status}"
+                )
                 return {
                     "email": email,
                     "status": status,
@@ -72,13 +77,15 @@ async def verify_email_with_retry(
                     "has_dns": parsed_flags["has_dns"],
                     "has_dns_mx": parsed_flags["has_dns_mx"],
                     "historical_response": parsed_flags["historical_response"],
+                    "verification_method": method,
+                    "transfer_bytes": transfer_bytes,
                     "proxy_session": last_session_id,
                     "attempts": attempt,
                     "latency_seconds": latency,
-                    "error": None
+                    "error": None,
                 }
 
-            # If error returned (e.g. 429 rate limit or 403 challenge), log warning and retry
+            # If error returned (e.g. 429 rate limit or 403 challenge), log warning and rotate session
             err_msg = res.get("error") or f"HTTP {res.get('status_code')}"
             Actor.log.warning(f"[{email}] Attempt {attempt} returned: {err_msg}. Rotating proxy session...")
             last_error = err_msg
@@ -104,17 +111,19 @@ async def verify_email_with_retry(
         "has_dns": False,
         "has_dns_mx": False,
         "historical_response": False,
+        "verification_method": "failed",
+        "transfer_bytes": 0,
         "proxy_session": last_session_id,
         "attempts": MAX_RETRIES_PER_EMAIL,
         "latency_seconds": latency,
-        "error": last_error or "Max retries exceeded"
+        "error": last_error or "Max retries exceeded",
     }
 
 
 async def main():
     async with Actor:
         actor_input = await Actor.get_input() or {}
-        
+
         # Collect emails from single 'email' or list 'emails'
         raw_emails: List[str] = []
         if actor_input.get("email"):
@@ -141,23 +150,27 @@ async def main():
                 "has_dns": False,
                 "has_dns_mx": False,
                 "historical_response": False,
+                "verification_method": "invalid_input",
+                "transfer_bytes": 0,
                 "proxy_session": None,
                 "attempts": 0,
                 "latency_seconds": 0.0,
-                "error": error_msg
+                "error": error_msg,
             })
             await Actor.fail(status_message=error_msg)
             return
 
         Actor.log.info(f"Starting NeverBounce verification for {len(unique_emails)} email(s)...")
 
+        # Pre-mint PerimeterX session cookie locally (0 proxy bandwidth)
+        Actor.log.info("Initializing authentic browser session...")
+        await asyncio.to_thread(global_session.refresh_session)
+
         # Initialize Apify Residential Proxy Configuration
         proxy_configuration = None
         custom_proxy_url = actor_input.get("proxy_url") or os.environ.get("PROXY_URL")
         try:
-            proxy_configuration = await Actor.create_proxy_configuration(
-                groups=["RESIDENTIAL"]
-            )
+            proxy_configuration = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"])
             if proxy_configuration:
                 Actor.log.info("Apify Residential Proxy initialized successfully.")
             elif not custom_proxy_url:
@@ -180,10 +193,12 @@ async def main():
                     "has_dns": False,
                     "has_dns_mx": False,
                     "historical_response": False,
+                    "verification_method": "syntax_check",
+                    "transfer_bytes": 0,
                     "proxy_session": None,
                     "attempts": 0,
                     "latency_seconds": 0.0,
-                    "error": "Invalid email syntax format"
+                    "error": "Invalid email syntax format",
                 }
                 await Actor.push_data(output)
                 continue
@@ -191,7 +206,7 @@ async def main():
             result = await verify_email_with_retry(
                 email=email,
                 proxy_configuration=proxy_configuration,
-                custom_proxy_url=custom_proxy_url
+                custom_proxy_url=custom_proxy_url,
             )
             await Actor.push_data(result)
 

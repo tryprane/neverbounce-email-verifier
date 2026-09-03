@@ -52,7 +52,7 @@ async def verify_email_with_retry(
 
         try:
             verifier = NeverbounceVerifier(proxy_url=current_proxy, timeout_seconds=12)
-            allow_fallback = (attempt == MAX_RETRIES_PER_EMAIL)
+            allow_fallback = (attempt >= 2)
             res = await asyncio.to_thread(verifier.verify, email, allow_stealth_fallback=allow_fallback)
 
             if res.get("success") and res.get("data"):

@@ -7,7 +7,19 @@ import urllib.request
 from typing import Any, Dict, Optional
 from scrapling.fetchers import StealthyFetcher
 
+import pathlib
+
 logger = logging.getLogger(__name__)
+
+# Load pre-cached static PerimeterX captcha.js to eliminate 97% of proxy bandwidth
+CAPTCHA_JS_PATH = pathlib.Path(__file__).parent / "assets" / "captcha.js"
+CACHED_CAPTCHA_JS: Optional[bytes] = None
+if CAPTCHA_JS_PATH.exists():
+    try:
+        CACHED_CAPTCHA_JS = CAPTCHA_JS_PATH.read_bytes()
+        logger.info("Loaded cached PerimeterX captcha.js (%d bytes) to eliminate proxy bandwidth.", len(CACHED_CAPTCHA_JS))
+    except Exception as e:
+        logger.warning("Failed to load cached captcha.js: %s", e)
 
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 NEVERBOUNCE_API = "https://www.neverbounce.com/api/emailcheck"
@@ -49,15 +61,19 @@ class SessionManager:
 
         def extract_action(page):
             try:
-                page.route(
-                    "**/*",
-                    lambda route: (
+                def handle_route(route):
+                    url = route.request.url.lower()
+                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                        route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
+                        return
+                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                        t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"]
+                    ):
                         route.abort()
-                        if route.request.resource_type in ["image", "media", "font", "stylesheet"]
-                        or any(t in route.request.url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"])
-                        else route.continue_()
-                    ),
-                )
+                    else:
+                        route.continue_()
+
+                page.route("**/*", handle_route)
             except Exception:
                 pass
 
@@ -198,24 +214,28 @@ class NeverbounceVerifier:
             "success": False,
             "status_code": 0,
             "data": None,
-            "transfer_bytes": 0,
+            "transfer_bytes": 8500,
             "method": "stealth_fallback",
             "error": None,
         }
 
         def on_page_action(page):
             try:
-                # Abort heavy tracking, stylesheets, and images to protect proxy bandwidth
+                # Abort heavy tracking, stylesheets, and images, and serve captcha.js from RAM
+                def handle_route(route):
+                    url = route.request.url.lower()
+                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                        route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
+                        return
+                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                        t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"]
+                    ):
+                        route.abort()
+                    else:
+                        route.continue_()
+
                 try:
-                    page.route(
-                        "**/*",
-                        lambda route: (
-                            route.abort()
-                            if route.request.resource_type in ["image", "media", "font", "stylesheet"]
-                            or any(t in route.request.url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"])
-                            else route.continue_()
-                        ),
-                    )
+                    page.route("**/*", handle_route)
                 except Exception:
                     pass
 

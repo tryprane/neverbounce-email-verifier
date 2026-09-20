@@ -233,7 +233,7 @@ async def main():
         Actor.log.info(f"Loaded {len(emails)} unique target email(s) for verification.")
 
         # 2. Concurrency & Retry bounds
-        concurrency = int(actor_input.get("max_concurrency") or 3)
+        concurrency = int(actor_input.get("max_concurrency") or 1)
         concurrency = max(1, min(10, concurrency))  # Bounded between 1 and 10
         max_retries = int(actor_input.get("max_retries") or 2)
         max_retries = max(1, min(5, max_retries))

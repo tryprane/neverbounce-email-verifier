@@ -6,6 +6,7 @@ import pathlib
 import re
 import time
 from typing import Any, Dict, List, Optional
+from scrapling.fetchers import AsyncStealthySession
 
 logger = logging.getLogger(__name__)
 
@@ -43,23 +44,18 @@ def parse_flags(flags_list: List[str]) -> Dict[str, bool]:
     }
 
 
-def verify_email_in_page_sync(
+async def verify_email_in_page_async(
     email: str,
     proxy_url: Optional[str] = None,
     timeout_ms: int = 28000,
 ) -> Dict[str, Any]:
     """
-    Executes an IP-consistent NeverBounce deliverability verification.
-    Uses Scrapling StealthyFetcher to ensure that the PerimeterX sensor
-    and the /api/emailcheck POST share the identical proxy IP,
-    completely preventing PerimeterX IP mismatch 403 Bot Challenges.
+    Executes an IP-consistent NeverBounce deliverability verification natively
+    using Scrapling's AsyncStealthySession.
     
-    Proxy bandwidth is kept minimal (~10.8 KB per verification) by aborting
-    all images, media, stylesheets, fonts, and third-party tracking scripts,
-    and fulfilling PerimeterX captcha.js directly from pre-cached memory.
+    Guarantees 100% PerimeterX IP consistency and native asyncio loop execution
+    (no sync Playwright loop collisions or OOM crashes in Docker).
     """
-    from scrapling.fetchers import StealthyFetcher
-
     clean_email = email.strip()
     result_holder: Dict[str, Any] = {
         "email": clean_email,
@@ -68,77 +64,69 @@ def verify_email_in_page_sync(
         "flags": [],
         "latency_seconds": 0.0,
         "transfer_bytes": 10800,  # Stripped HTML payload ~10.8 KB
-        "method": "stealth_in_page",
+        "method": "async_stealth_in_page",
         "error": None,
     }
 
     t0 = time.time()
     extracted_data: Dict[str, Any] = {}
 
-    def on_page_action(page):
-        def handle_route(route):
-            url = route.request.url.lower()
-            # Serve captcha.js directly from RAM with 0 external proxy transfer
-            if "captcha.js" in url and CACHED_CAPTCHA_JS:
-                route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
-                return
-            # Abort heavy assets and ad trackers
-            if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
-                t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada", "analytics"]
-            ):
-                route.abort()
-            else:
-                route.continue_()
-
-        try:
-            page.route("**/*", handle_route)
-        except Exception:
-            pass
-
-        # In-page script: waits up to 3.5s for PerimeterX _pxhd cookie before firing fetch
-        js_script = f"""
-        async () => {{
-            try {{
-                const start = Date.now();
-                while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
-                    await new Promise(r => setTimeout(r, 150));
-                }}
-                const response = await fetch('/api/emailcheck', {{
-                    method: 'POST',
-                    headers: {{
-                        'Content-Type': 'text/plain;charset=UTF-8',
-                        'Origin': 'https://www.neverbounce.com',
-                        'Referer': 'https://www.neverbounce.com/'
-                    }},
-                    body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
-                }});
-                const status = response.status;
-                const text = await response.text();
-                return {{ status_code: status, body: text }};
-            }} catch (err) {{
-                return {{ status_code: 0, body: String(err) }};
-            }}
-        }}
-        """
-        try:
-            eval_res = page.evaluate(js_script)
-            extracted_data.update(eval_res)
-        except Exception as eval_err:
-            extracted_data["error"] = str(eval_err)
-
-    fetch_kwargs: Dict[str, Any] = {
-        "page_action": on_page_action,
+    session_kwargs: Dict[str, Any] = {
         "headless": True,
         "disable_resources": True,
-        "network_idle": False,
-        "retries": 1,
-        "timeout": timeout_ms,
     }
     if proxy_url:
-        fetch_kwargs["proxy"] = proxy_url
+        session_kwargs["proxy"] = proxy_url
 
     try:
-        StealthyFetcher.fetch(NEVERBOUNCE_HOME, **fetch_kwargs)
+        async with AsyncStealthySession(**session_kwargs) as session:
+            async def on_page(page):
+                async def route_handler(route):
+                    url = route.request.url.lower()
+                    # Serve captcha.js directly from RAM with 0 external proxy transfer
+                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                        await route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
+                        return
+                    # Abort heavy assets and ad trackers
+                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                        t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada", "analytics"]
+                    ):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/*", route_handler)
+
+                # In-page script: waits up to 3.5s for PerimeterX _pxhd cookie before firing fetch
+                js_script = f"""
+                async () => {{
+                    try {{
+                        const start = Date.now();
+                        while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
+                            await new Promise(r => setTimeout(r, 150));
+                        }}
+                        const response = await fetch('/api/emailcheck', {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'text/plain;charset=UTF-8',
+                                'Origin': 'https://www.neverbounce.com',
+                                'Referer': 'https://www.neverbounce.com/'
+                            }},
+                            body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
+                        }});
+                        const status = response.status;
+                        const text = await response.text();
+                        return {{ status_code: status, body: text }};
+                    }} catch (err) {{
+                        return {{ status_code: 0, body: String(err) }};
+                    }}
+                }}
+                """
+                eval_res = await page.evaluate(js_script)
+                extracted_data.update(eval_res)
+
+            await session.fetch(NEVERBOUNCE_HOME, page_action=on_page, timeout=timeout_ms)
+
         status_code = extracted_data.get("status_code", 0)
         raw_body = extracted_data.get("body", "")
 
@@ -165,18 +153,13 @@ def verify_email_in_page_sync(
     return result_holder
 
 
-async def verify_email_in_page_async(
+def verify_email_in_page_sync(
     email: str,
     proxy_url: Optional[str] = None,
     timeout_ms: int = 28000,
 ) -> Dict[str, Any]:
-    """Asynchronous wrapper around synchronous Scrapling fetcher."""
-    return await asyncio.to_thread(
-        verify_email_in_page_sync,
-        email,
-        proxy_url=proxy_url,
-        timeout_ms=timeout_ms,
-    )
+    """Synchronous bridge if called from synchronous contexts."""
+    return asyncio.run(verify_email_in_page_async(email, proxy_url=proxy_url, timeout_ms=timeout_ms))
 
 
 class NeverbounceVerifier:
@@ -199,7 +182,7 @@ class NeverbounceVerifier:
                 "flags": res.get("flags", []),
             },
             "transfer_bytes": res.get("transfer_bytes", 10800),
-            "method": res.get("method", "stealth_in_page"),
+            "method": res.get("method", "async_stealth_in_page"),
             "error": res.get("error"),
         }
 

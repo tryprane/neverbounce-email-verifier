@@ -15,6 +15,6 @@
   },
   "defaultRunOptions": {
     "memoryMbytes": 2048,
-    "timeoutSecs": 180
+    "timeoutSecs": 600
   }
 }

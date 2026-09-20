@@ -1,29 +1,63 @@
 {
-  "title": "NeverBounce Email Verifier Input",
+  "title": "NeverBounce Bulk Email Verifier Input",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "email": {
-      "title": "Email Address",
-      "type": "string",
-      "description": "Single email address to verify (e.g. support@neverbounce.com or satya@microsoft.com).",
-      "editor": "textfield",
-      "prefill": "support@neverbounce.com"
-    },
     "emails": {
-      "title": "Email List (Batch)",
+      "title": "Email List (Array)",
       "type": "array",
-      "description": "Optional list of emails to verify in a single run.",
+      "description": "Array of email addresses to verify in this run.",
       "editor": "stringList",
-      "items": {
-        "type": "string"
+      "prefill": [
+        "support@neverbounce.com",
+        "satya@microsoft.com",
+        "bill.gates@gatesfoundation.org"
+      ]
+    },
+    "emails_text": {
+      "title": "Bulk Emails (Paste Text)",
+      "type": "string",
+      "description": "Paste raw text containing multiple emails separated by newlines, spaces, or commas. The actor automatically extracts all valid emails.",
+      "editor": "textarea"
+    },
+    "email": {
+      "title": "Single Email (Quick Test)",
+      "type": "string",
+      "description": "Single email address for a quick verification test.",
+      "editor": "textfield"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Apify Proxy configuration. Automatically rotates unique session IPs on each request.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true
       }
     },
-    "proxy_url": {
-      "title": "Custom Residential Proxy URL (Optional)",
-      "type": "string",
-      "description": "Optional custom proxy URL (format: http://user:pass@host:port). If omitted, Apify Residential Proxy will be used automatically.",
-      "editor": "textfield"
+    "custom_proxies": {
+      "title": "Custom Proxy URLs (Optional)",
+      "type": "array",
+      "description": "List of custom proxy URLs (format: http://user:pass@host:port) to rotate round-robin. If provided, overrides Apify Proxy.",
+      "editor": "stringList"
+    },
+    "max_concurrency": {
+      "title": "Concurrency (Parallel Workers)",
+      "type": "integer",
+      "description": "Number of concurrent email verifications. Default is 3 (optimal for 2GB memory).",
+      "editor": "number",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 10
+    },
+    "max_retries": {
+      "title": "Max Retries per Email",
+      "type": "integer",
+      "description": "Number of retry attempts with a fresh rotated proxy on rate limits or challenges.",
+      "editor": "number",
+      "default": 2,
+      "minimum": 1,
+      "maximum": 5
     }
   }
 }

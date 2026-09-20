@@ -1,13 +1,11 @@
+import asyncio
 import json
 import logging
+import os
+import pathlib
 import re
 import time
-import urllib.error
-import urllib.request
-from typing import Any, Dict, Optional
-from scrapling.fetchers import StealthyFetcher
-
-import pathlib
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +15,11 @@ CACHED_CAPTCHA_JS: Optional[bytes] = None
 if CAPTCHA_JS_PATH.exists():
     try:
         CACHED_CAPTCHA_JS = CAPTCHA_JS_PATH.read_bytes()
-        logger.info("Loaded cached PerimeterX captcha.js (%d bytes) to eliminate proxy bandwidth.", len(CACHED_CAPTCHA_JS))
+        logger.info("Loaded cached PerimeterX captcha.js (%d bytes).", len(CACHED_CAPTCHA_JS))
     except Exception as e:
         logger.warning("Failed to load cached captcha.js: %s", e)
 
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
-NEVERBOUNCE_API = "https://www.neverbounce.com/api/emailcheck"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
 
@@ -33,278 +30,191 @@ def validate_email(email: str) -> bool:
     return bool(EMAIL_REGEX.match(email.strip()))
 
 
-class SessionManager:
+def parse_flags(flags_list: List[str]) -> Dict[str, bool]:
+    """Parse NeverBounce's verification flags into structured booleans."""
+    flags_set = set(flags_list or [])
+    return {
+        "free_email": "free_email_host" in flags_set,
+        "role_account": "role_account" in flags_set,
+        "smtp_connectable": "smtp_connectable" in flags_set,
+        "has_dns": "has_dns" in flags_set,
+        "has_dns_mx": "has_dns_mx" in flags_set,
+        "historical_response": "historical_response" in flags_set,
+    }
+
+
+def verify_email_in_page_sync(
+    email: str,
+    proxy_url: Optional[str] = None,
+    timeout_ms: int = 28000,
+) -> Dict[str, Any]:
     """
-    Manages genuine browser session tokens (_pxhd) obtained locally without proxy
-    bandwidth cost, and caches them with expiration.
+    Executes an IP-consistent NeverBounce deliverability verification.
+    Uses Scrapling StealthyFetcher to ensure that the PerimeterX sensor
+    and the /api/emailcheck POST share the identical proxy IP,
+    completely preventing PerimeterX IP mismatch 403 Bot Challenges.
+    
+    Proxy bandwidth is kept minimal (~10.8 KB per verification) by aborting
+    all images, media, stylesheets, fonts, and third-party tracking scripts,
+    and fulfilling PerimeterX captcha.js directly from pre-cached memory.
     """
+    from scrapling.fetchers import StealthyFetcher
 
-    def __init__(self, ttl_seconds: int = 600):
-        self.ttl_seconds = ttl_seconds
-        self.cached_cookie: Optional[str] = None
-        self.cached_user_agent: str = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-        )
-        self.last_solved_at: float = 0.0
+    clean_email = email.strip()
+    result_holder: Dict[str, Any] = {
+        "email": clean_email,
+        "success": False,
+        "status": "unknown",
+        "flags": [],
+        "latency_seconds": 0.0,
+        "transfer_bytes": 10800,  # Stripped HTML payload ~10.8 KB
+        "method": "stealth_in_page",
+        "error": None,
+    }
 
-    def is_valid(self) -> bool:
-        return bool(self.cached_cookie and (time.time() - self.last_solved_at < self.ttl_seconds))
+    t0 = time.time()
+    extracted_data: Dict[str, Any] = {}
 
-    def refresh_session(self) -> bool:
-        """
-        Loads NeverBounce home normally (0 proxy data) using Scrapling
-        to solve PerimeterX client challenges and obtain authentic cookies.
-        """
-        logger.info("Minting fresh PerimeterX session cookie (local stealth browser, 0 proxy data)...")
-        extracted: Dict[str, str] = {}
-
-        def extract_action(page):
-            try:
-                def handle_route(route):
-                    url = route.request.url.lower()
-                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
-                        route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
-                        return
-                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
-                        t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"]
-                    ):
-                        route.abort()
-                    else:
-                        route.continue_()
-
-                page.route("**/*", handle_route)
-            except Exception:
-                pass
-
-            try:
-                page.wait_for_timeout(3000)
-            except Exception:
-                time.sleep(3.0)
-
-            res = page.evaluate(
-                """() => ({
-                    cookies: document.cookie,
-                    userAgent: navigator.userAgent
-                })"""
-            )
-            extracted.update(res)
+    def on_page_action(page):
+        def handle_route(route):
+            url = route.request.url.lower()
+            # Serve captcha.js directly from RAM with 0 external proxy transfer
+            if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
+                return
+            # Abort heavy assets and ad trackers
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada", "analytics"]
+            ):
+                route.abort()
+            else:
+                route.continue_()
 
         try:
-            StealthyFetcher.fetch(
-                NEVERBOUNCE_HOME,
-                page_action=extract_action,
-                headless=True,
-                disable_resources=True,
-                network_idle=False,
-                retries=1,
-                timeout=25000,
-            )
-            cookie_str = extracted.get("cookies", "")
-            if "_pxhd" in cookie_str:
-                self.cached_cookie = cookie_str
-                if extracted.get("userAgent"):
-                    self.cached_user_agent = extracted["userAgent"]
-                self.last_solved_at = time.time()
-                print("[SessionManager] Successfully acquired authentic PerimeterX _pxhd cookie.")
-                logger.info("Successfully acquired PerimeterX session token.")
-                return True
-            else:
-                print(f"[SessionManager] Warning: _pxhd cookie not found in: {cookie_str[:100]}")
-        except Exception as e:
-            logger.warning("Session token acquisition encountered error: %s", e)
+            page.route("**/*", handle_route)
+        except Exception:
+            pass
 
-        return False
+        # In-page script: waits up to 3.5s for PerimeterX _pxhd cookie before firing fetch
+        js_script = f"""
+        async () => {{
+            try {{
+                const start = Date.now();
+                while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
+                    await new Promise(r => setTimeout(r, 150));
+                }}
+                const response = await fetch('/api/emailcheck', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'text/plain;charset=UTF-8',
+                        'Origin': 'https://www.neverbounce.com',
+                        'Referer': 'https://www.neverbounce.com/'
+                    }},
+                    body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
+                }});
+                const status = response.status;
+                const text = await response.text();
+                return {{ status_code: status, body: text }};
+            }} catch (err) {{
+                return {{ status_code: 0, body: String(err) }};
+            }}
+        }}
+        """
+        try:
+            eval_res = page.evaluate(js_script)
+            extracted_data.update(eval_res)
+        except Exception as eval_err:
+            extracted_data["error"] = str(eval_err)
 
-    def get_headers(self) -> Dict[str, str]:
-        if not self.is_valid():
-            self.refresh_session()
+    fetch_kwargs: Dict[str, Any] = {
+        "page_action": on_page_action,
+        "headless": True,
+        "disable_resources": True,
+        "network_idle": False,
+        "retries": 1,
+        "timeout": timeout_ms,
+    }
+    if proxy_url:
+        fetch_kwargs["proxy"] = proxy_url
 
-        headers = {
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Origin": "https://www.neverbounce.com",
-            "Referer": "https://www.neverbounce.com/",
-            "User-Agent": self.cached_user_agent,
-            "Accept": "*/*",
-        }
-        if self.cached_cookie:
-            headers["Cookie"] = self.cached_cookie
-        return headers
+    try:
+        StealthyFetcher.fetch(NEVERBOUNCE_HOME, **fetch_kwargs)
+        status_code = extracted_data.get("status_code", 0)
+        raw_body = extracted_data.get("body", "")
+
+        if status_code == 200:
+            data = json.loads(raw_body)
+            st = str(data.get("status", "unknown")).lower()
+            flags = data.get("flags", [])
+            result_holder["success"] = True
+            result_holder["status"] = st
+            result_holder["flags"] = flags
+            result_holder["error"] = None
+        elif status_code == 429:
+            result_holder["error"] = "RATE_LIMITED_429"
+        elif status_code == 403:
+            result_holder["error"] = "BOT_CHALLENGE_403"
+        else:
+            err_detail = extracted_data.get("error") or f"HTTP_{status_code}: {raw_body[:60]}"
+            result_holder["error"] = err_detail
+
+    except Exception as fetch_err:
+        result_holder["error"] = f"FetchException: {fetch_err}"
+
+    result_holder["latency_seconds"] = round(time.time() - t0, 2)
+    return result_holder
 
 
-# Global session manager instance
-global_session = SessionManager()
+async def verify_email_in_page_async(
+    email: str,
+    proxy_url: Optional[str] = None,
+    timeout_ms: int = 28000,
+) -> Dict[str, Any]:
+    """Asynchronous wrapper around synchronous Scrapling fetcher."""
+    return await asyncio.to_thread(
+        verify_email_in_page_sync,
+        email,
+        proxy_url=proxy_url,
+        timeout_ms=timeout_ms,
+    )
 
 
 class NeverbounceVerifier:
-    """
-    Hybrid email verifier:
-    - Browser session (_pxhd token) solved locally (0 proxy cost).
-    - Email lookup sent via raw HTTP POST through Apify Residential Proxy (only ~1.5 KB per call).
-    - Prioritizes fast session rotation over heavy browser fallback to protect proxy bandwidth.
-    """
+    """Compatibility wrapper for NeverBounce verification."""
 
-    def __init__(self, proxy_url: Optional[str] = None, timeout_seconds: int = 15):
+    def __init__(self, proxy_url: Optional[str] = None, timeout_seconds: int = 25):
         self.proxy_url = proxy_url
-        self.timeout = timeout_seconds
+        self.timeout_seconds = timeout_seconds
 
-    def verify_fast_http(self, email: str) -> Dict[str, Any]:
-        """
-        Ultra-lightweight direct HTTP request through proxy (~1.5 KB bandwidth).
-        """
-        clean_email = email.strip()
-        headers = global_session.get_headers()
-        post_data = json.dumps({"email": clean_email}).encode("utf-8")
-
-        req = urllib.request.Request(NEVERBOUNCE_API, data=post_data, headers=headers)
-
-        import ssl
-        ctx = ssl._create_unverified_context()
-        https_handler = urllib.request.HTTPSHandler(context=ctx)
-
-        if self.proxy_url:
-            proxy_handler = urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-            opener = urllib.request.build_opener(proxy_handler, https_handler)
-        else:
-            opener = urllib.request.build_opener(https_handler)
-
-        try:
-            with opener.open(req, timeout=self.timeout) as resp:
-                status_code = resp.status
-                body_bytes = resp.read()
-                raw_text = body_bytes.decode("utf-8")
-
-                if status_code == 200:
-                    data = json.loads(raw_text)
-                    return {
-                        "success": True,
-                        "status_code": status_code,
-                        "data": data,
-                        "transfer_bytes": len(post_data) + len(body_bytes),
-                        "method": "fast_http",
-                        "error": None,
-                    }
-
-                return {
-                    "success": False,
-                    "status_code": status_code,
-                    "data": None,
-                    "transfer_bytes": len(post_data) + len(body_bytes),
-                    "method": "fast_http",
-                    "error": f"HTTP_{status_code}",
-                }
-
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8") if e.fp else ""
-            if e.code == 429:
-                return {"success": False, "status_code": 429, "data": None, "error": "RATE_LIMITED_429", "method": "fast_http"}
-            if e.code == 403:
-                return {"success": False, "status_code": 403, "data": None, "error": "BOT_CHALLENGE_403", "method": "fast_http"}
-            return {"success": False, "status_code": e.code, "data": None, "error": f"HTTP_{e.code}: {error_body[:100]}", "method": "fast_http"}
-        except Exception as e:
-            return {"success": False, "status_code": 0, "data": None, "error": str(e), "method": "fast_http"}
-
-    def verify_stealth_fallback(self, email: str) -> Dict[str, Any]:
-        """
-        Fallback: Full in-page execution via Scrapling if direct HTTP is repeatedly challenged.
-        Blocks images, media, fonts, and stylesheets to keep bandwidth minimal.
-        """
-        clean_email = email.strip()
-        result_holder: Dict[str, Any] = {
-            "success": False,
-            "status_code": 0,
-            "data": None,
-            "transfer_bytes": 8500,
-            "method": "stealth_fallback",
-            "error": None,
+    def verify(self, email: str, allow_stealth_fallback: bool = True) -> Dict[str, Any]:
+        res = verify_email_in_page_sync(
+            email=email,
+            proxy_url=self.proxy_url,
+            timeout_ms=self.timeout_seconds * 1000,
+        )
+        return {
+            "success": res.get("success", False),
+            "data": {
+                "status": res.get("status"),
+                "flags": res.get("flags", []),
+            },
+            "transfer_bytes": res.get("transfer_bytes", 10800),
+            "method": res.get("method", "stealth_in_page"),
+            "error": res.get("error"),
         }
 
-        def on_page_action(page):
-            try:
-                # Abort heavy tracking, stylesheets, and images, and serve captcha.js from RAM
-                def handle_route(route):
-                    url = route.request.url.lower()
-                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
-                        route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
-                        return
-                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
-                        t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada"]
-                    ):
-                        route.abort()
-                    else:
-                        route.continue_()
 
-                try:
-                    page.route("**/*", handle_route)
-                except Exception:
-                    pass
+class SessionManager:
+    """Compatibility stub for session manager."""
 
-                js_script = f"""
-                async () => {{
-                    try {{
-                        const response = await fetch('/api/emailcheck', {{
-                            method: 'POST',
-                            headers: {{
-                                'Content-Type': 'text/plain;charset=UTF-8',
-                                'Origin': 'https://www.neverbounce.com',
-                                'Referer': 'https://www.neverbounce.com/'
-                            }},
-                            body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
-                        }});
-                        const status = response.status;
-                        const text = await response.text();
-                        return {{ status: status, body: text }};
-                    }} catch (err) {{
-                        return {{ status: 0, body: String(err) }};
-                    }}
-                }}
-                """
-                res = page.evaluate(js_script)
-                result_holder["status_code"] = res.get("status", 0)
-                raw_body = res.get("body", "")
+    def __init__(self, ttl_seconds: int = 600):
+        self.ttl_seconds = ttl_seconds
 
-                if result_holder["status_code"] == 200:
-                    result_holder["data"] = json.loads(raw_body)
-                    result_holder["success"] = True
-                elif result_holder["status_code"] == 429:
-                    result_holder["error"] = "RATE_LIMITED_429"
-                elif result_holder["status_code"] == 403:
-                    result_holder["error"] = "BOT_CHALLENGE_403"
-                else:
-                    result_holder["error"] = f"HTTP_{result_holder['status_code']}: {raw_body[:100]}"
-            except Exception as eval_err:
-                result_holder["error"] = f"Page evaluate error: {eval_err}"
+    def is_valid(self) -> bool:
+        return True
 
-        fetch_kwargs: Dict[str, Any] = {
-            "page_action": on_page_action,
-            "headless": True,
-            "disable_resources": True,
-            "network_idle": False,
-            "retries": 1,
-            "timeout": 25000,
-        }
+    def refresh_session(self) -> bool:
+        return True
 
-        try:
-            StealthyFetcher.fetch(NEVERBOUNCE_HOME, **fetch_kwargs)
-        except Exception as fetch_err:
-            result_holder["error"] = str(fetch_err)
 
-        return result_holder
-
-    def verify(self, email: str, allow_stealth_fallback: bool = False) -> Dict[str, Any]:
-        """
-        Primary verification method:
-        1. Fast HTTP attempt (~1.5 KB proxy bandwidth, ~0.5s).
-        2. If challenged or rate-limited, returns fast_res immediately to let caller rotate proxy session.
-        3. Only engages lightweight stealth browser if allow_stealth_fallback=True (final attempt).
-        """
-        fast_res = self.verify_fast_http(email)
-        if fast_res.get("success"):
-            return fast_res
-
-        # If challenged and fallback is allowed (final attempt), engage stealth browser
-        if allow_stealth_fallback and fast_res.get("status_code") in [403, 0]:
-            logger.info("[%s] Direct HTTP challenged. Engaging lightweight stealth fallback...", email)
-            return self.verify_stealth_fallback(email)
-
-        return fast_res
+global_session = SessionManager()

@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
-from scrapling.engines._browsers._stealth import _compiled_stealth_scripts
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +23,16 @@ for fname in ["captcha.js", "auditor.js", "main.min.js", "index.js"]:
             logger.info("Loaded pre-cached %s (%d bytes).", fname, len(CACHED_SCRIPTS[fname]))
         except Exception as e:
             logger.warning("Failed to load %s: %s", fname, e)
+
+# Self-contained stealth scripts for Chromium evasion
+STEALTH_JS: Optional[str] = None
+STEALTH_PATH = ASSETS_DIR / "stealth.js"
+if STEALTH_PATH.exists():
+    try:
+        STEALTH_JS = STEALTH_PATH.read_text(encoding="utf-8")
+        logger.info("Loaded self-contained stealth.js (%d bytes).", len(STEALTH_JS))
+    except Exception as e:
+        logger.warning("Failed to load stealth.js: %s", e)
 
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
@@ -56,7 +65,7 @@ async def verify_email_in_page_async(
 ) -> Dict[str, Any]:
     """
     Executes an IP-consistent NeverBounce deliverability verification natively using Playwright
-    with Scrapling stealth evasion and pre-navigation RAM fulfillment of PerimeterX assets.
+    with pre-navigation RAM fulfillment of PerimeterX assets.
     
     Guarantees:
     1. Pre-navigation Route Interception: All 4 heavy JS scripts (2.3+ MB) are fulfilled from RAM.
@@ -113,9 +122,9 @@ async def verify_email_in_page_async(
                 ignore_https_errors=True,
             )
 
-            # Inject compiled stealth scripts before any page navigation
-            for script in _compiled_stealth_scripts():
-                await context.add_init_script(script=script)
+            # Inject self-contained stealth scripts
+            if STEALTH_JS:
+                await context.add_init_script(script=STEALTH_JS)
 
             # PRE-NAVIGATION ROUTE INTERCEPTION:
             # Fulfill all static heavy scripts directly from RAM and abort trackers

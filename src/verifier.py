@@ -28,34 +28,7 @@ CACHED_PX_SENSOR: Optional[bytes] = None
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-# ---------------------------------------------------------------------------
-# WHITELIST: Only these URL patterns are allowed through the proxy.
-# Everything else is aborted → zero bandwidth for Next.js bundles, CSS, etc.
-# ---------------------------------------------------------------------------
-WHITELIST_PATTERNS = [
-    "neverbounce.com/$",        # HTML document (exact homepage)
-    "neverbounce.com/?$",       # HTML document (with trailing slash variants)
-    "/px.js",                   # PerimeterX sensor script
-    "/captcha.js",              # PerimeterX captcha (served from RAM)
-    "/api/emailcheck",          # The actual verification API call
-    "/px/",                     # PX beacon/collector endpoints
-    "/b/s/",                    # PX telemetry endpoint
-    "captcha/captcha.js",       # Alternate PX captcha path
-    "client.perimeterx.net",    # PX CDN
-    "collector-px",             # PX collector subdomain
-]
 
-
-def _is_whitelisted(url: str) -> bool:
-    """Check if a URL matches any whitelisted pattern."""
-    url_lower = url.lower()
-    for pattern in WHITELIST_PATTERNS:
-        if pattern in url_lower:
-            return True
-    # Allow the initial navigation document request
-    if url_lower.rstrip("/") == "https://www.neverbounce.com":
-        return True
-    return False
 
 
 def validate_email(email: str) -> bool:
@@ -120,122 +93,142 @@ async def verify_email_in_page_async(
 
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
-            async def on_page(page):
-                nonlocal wire_bytes
-                global CACHED_PX_SENSOR
+            context = session.context
+            page = await context.new_page()
 
-                # Track only actual wire bytes (not RAM-fulfilled responses)
-                ram_fulfilled_urls = set()
+            # Track only actual wire bytes (not RAM-fulfilled responses)
+            ram_fulfilled_urls = set()
+            cdp_active = False
+            try:
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.enable")
 
+                def on_loading_finished(params):
+                    nonlocal wire_bytes
+                    wire_bytes += params.get("encodedDataLength", 0)
+
+                cdp.on("Network.loadingFinished", on_loading_finished)
+                cdp_active = True
+            except Exception:
+                pass
+
+            if not cdp_active:
                 async def on_resp(resp):
                     nonlocal wire_bytes
-                    # Skip bandwidth counting for RAM-fulfilled responses
                     if resp.url in ram_fulfilled_urls:
                         return
                     try:
-                        # Try to get size from content-length header first
                         cl = resp.headers.get("content-length")
                         if cl and cl.isdigit():
-                            size = int(cl)
+                            wire_bytes += int(cl)
                         else:
-                            # Fallback: try to read body
                             try:
                                 b = await resp.body()
-                                size = len(b)
+                                wire_bytes += len(b)
                             except Exception:
-                                size = 0
-                        wire_bytes += size
-                        if size > 100:
-                            logger.info("WIRE: %d B | %s | %s", size, resp.status, resp.url[:120])
+                                pass
                     except Exception:
                         pass
 
                 page.on("response", on_resp)
 
-                async def route_handler(route):
-                    global CACHED_PX_SENSOR
-                    url = route.request.url
-                    url_lower = url.lower()
+            # Route handler attached BEFORE page.goto() — blocks 100% of Next.js chunks, GTM, etc.
+            async def route_handler(route):
+                global CACHED_PX_SENSOR
+                url = route.request.url
+                url_lower = url.lower()
+                rtype = route.request.resource_type
 
-                    # 1. Serve captcha.js from RAM (zero bandwidth)
-                    if "captcha.js" in url_lower and CACHED_CAPTCHA_JS:
-                        ram_fulfilled_urls.add(url)
-                        await route.fulfill(
-                            status=200,
-                            content_type="application/javascript",
-                            body=CACHED_CAPTCHA_JS,
-                            headers={"Access-Control-Allow-Origin": "*"},
-                        )
-                        return
+                # 1. Serve captcha.js from RAM (0 bytes wire bandwidth)
+                if "captcha.js" in url_lower and CACHED_CAPTCHA_JS:
+                    ram_fulfilled_urls.add(url)
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/javascript",
+                        body=CACHED_CAPTCHA_JS,
+                        headers={"Access-Control-Allow-Origin": "*"},
+                    )
+                    return
 
-                    # 2. Serve PX sensor from RAM if cached (zero bandwidth)
-                    if "/px.js" in url_lower and CACHED_PX_SENSOR:
-                        ram_fulfilled_urls.add(url)
-                        await route.fulfill(
-                            status=200,
-                            content_type="application/javascript",
-                            body=CACHED_PX_SENSOR,
-                            headers={"Access-Control-Allow-Origin": "*"},
-                        )
-                        return
+                # 2. Serve PX sensor from RAM if cached (0 bytes wire bandwidth)
+                if "/px.js" in url_lower and CACHED_PX_SENSOR:
+                    ram_fulfilled_urls.add(url)
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/javascript",
+                        body=CACHED_PX_SENSOR,
+                        headers={"Access-Control-Allow-Origin": "*"},
+                    )
+                    return
 
-                    # 3. WHITELIST CHECK: only allow essential requests
-                    if _is_whitelisted(url):
-                        await route.continue_()
-                    else:
-                        # Block everything not whitelisted (Next.js bundles, CSS, etc.)
-                        await route.abort()
+                # 3. Whitelist: Only allow NeverBounce main document, PerimeterX, and emailcheck
+                is_main_doc = rtype == "document" and "neverbounce.com" in url_lower
+                is_emailcheck = "/api/emailcheck" in url_lower
+                is_px_endpoint = any(k in url_lower for k in [
+                    "/btfn1q7w/",
+                    "/px/",
+                    "/b/s/",
+                    "collector-px",
+                    "client.perimeterx.net",
+                    "px-cloud.net",
+                    "/px.js",
+                ])
 
-                await page.route("**/*", route_handler)
+                if is_main_doc or is_emailcheck or is_px_endpoint:
+                    await route.continue_()
+                else:
+                    # Instantly abort all Next.js bundles, GTM, OneTrust, images, CSS
+                    await route.abort()
 
-                # After PX sensor loads for the first time, cache it for future sessions
-                async def cache_px_sensor(resp):
-                    global CACHED_PX_SENSOR
-                    if CACHED_PX_SENSOR is None and "/px.js" in resp.url.lower():
-                        try:
-                            body = await resp.body()
-                            if len(body) > 1000:  # Sanity check: real PX sensor is >10KB
-                                CACHED_PX_SENSOR = body
-                                logger.info("Cached PX sensor script (%d bytes) for future sessions.", len(body))
-                        except Exception:
-                            pass
+            await page.route("**/*", route_handler)
 
-                page.on("response", cache_px_sensor)
+            # After PX sensor loads for the first time, cache it for future sessions
+            async def cache_px_sensor(resp):
+                global CACHED_PX_SENSOR
+                if CACHED_PX_SENSOR is None and "/px.js" in resp.url.lower():
+                    try:
+                        body = await resp.body()
+                        if len(body) > 1000:
+                            CACHED_PX_SENSOR = body
+                            logger.info("Cached PX sensor script (%d bytes) for future sessions.", len(body))
+                    except Exception:
+                        pass
 
-                # In-page script: waits for PerimeterX _pxhd cookie, then fires emailcheck
-                js_script = f"""
-                async () => {{
-                    try {{
-                        const start = Date.now();
-                        while (!document.cookie.includes('_pxhd') && (Date.now() - start < 6000)) {{
-                            await new Promise(r => setTimeout(r, 150));
-                        }}
-                        const response = await fetch('/api/emailcheck', {{
-                            method: 'POST',
-                            headers: {{
-                                'Content-Type': 'text/plain;charset=UTF-8',
-                                'Origin': 'https://www.neverbounce.com',
-                                'Referer': 'https://www.neverbounce.com/'
-                            }},
-                            body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
-                        }});
-                        const status = response.status;
-                        const text = await response.text();
-                        return {{ status_code: status, body: text }};
-                    }} catch (err) {{
-                        return {{ status_code: 0, body: String(err) }};
+            page.on("response", cache_px_sensor)
+
+            # Navigate to NeverBounce home
+            await page.goto(NEVERBOUNCE_HOME, wait_until="commit", timeout=timeout_ms)
+
+            # In-page script: waits for PerimeterX _pxhd cookie, then fires emailcheck
+            js_script = f"""
+            async () => {{
+                try {{
+                    const start = Date.now();
+                    while (!document.cookie.includes('_pxhd') && (Date.now() - start < 6000)) {{
+                        await new Promise(r => setTimeout(r, 100));
                     }}
+                    const response = await fetch('/api/emailcheck', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'text/plain;charset=UTF-8',
+                            'Origin': 'https://www.neverbounce.com',
+                            'Referer': 'https://www.neverbounce.com/'
+                        }},
+                        body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
+                    }});
+                    const status = response.status;
+                    const text = await response.text();
+                    return {{ status_code: status, body: text }};
+                }} catch (err) {{
+                    return {{ status_code: 0, body: String(err) }};
                 }}
-                """
-                eval_res = await page.evaluate(js_script)
-                extracted_data.update(eval_res)
+            }}
+            """
+            eval_res = await page.evaluate(js_script)
+            extracted_data.update(eval_res)
 
-            await session.fetch(
-                NEVERBOUNCE_HOME,
-                page_action=on_page,
-                timeout=timeout_ms,
-                disable_resources=True,
-            )
+            await asyncio.sleep(0.05)
+            await page.close()
 
         status_code = extracted_data.get("status_code", 0)
         raw_body = extracted_data.get("body", "")

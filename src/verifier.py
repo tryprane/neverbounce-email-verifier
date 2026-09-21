@@ -10,7 +10,9 @@ from scrapling.fetchers import AsyncStealthySession
 
 logger = logging.getLogger(__name__)
 
-# Pre-cached static PerimeterX captcha.js
+# ---------------------------------------------------------------------------
+# Pre-cached static assets served from RAM (zero proxy bandwidth)
+# ---------------------------------------------------------------------------
 CAPTCHA_JS_PATH = pathlib.Path(__file__).parent / "assets" / "captcha.js"
 CACHED_CAPTCHA_JS: Optional[bytes] = None
 if CAPTCHA_JS_PATH.exists():
@@ -20,24 +22,40 @@ if CAPTCHA_JS_PATH.exists():
     except Exception as e:
         logger.warning("Failed to load cached captcha.js: %s", e)
 
+# PX sensor script cached in RAM after first download (shared across all sessions)
+CACHED_PX_SENSOR: Optional[bytes] = None
+
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-BLOCKED_DOMAINS = {
-    "zoominfo.com",
-    "googleads.g.doubleclick.net",
-    "facebook.com",
-    "datadoghq.com",
-    "fonts.googleapis.com",
-    "fonts.gstatic.com",
-    "ada.support",
-    "clarity.ms",
-    "hubspot.com",
-    "analytics.google.com",
-    "googletagmanager.com",
-    "connect.facebook.net",
-    "bat.bing.com",
-}
+# ---------------------------------------------------------------------------
+# WHITELIST: Only these URL patterns are allowed through the proxy.
+# Everything else is aborted → zero bandwidth for Next.js bundles, CSS, etc.
+# ---------------------------------------------------------------------------
+WHITELIST_PATTERNS = [
+    "neverbounce.com/$",        # HTML document (exact homepage)
+    "neverbounce.com/?$",       # HTML document (with trailing slash variants)
+    "/px.js",                   # PerimeterX sensor script
+    "/captcha.js",              # PerimeterX captcha (served from RAM)
+    "/api/emailcheck",          # The actual verification API call
+    "/px/",                     # PX beacon/collector endpoints
+    "/b/s/",                    # PX telemetry endpoint
+    "captcha/captcha.js",       # Alternate PX captcha path
+    "client.perimeterx.net",    # PX CDN
+    "collector-px",             # PX collector subdomain
+]
+
+
+def _is_whitelisted(url: str) -> bool:
+    """Check if a URL matches any whitelisted pattern."""
+    url_lower = url.lower()
+    for pattern in WHITELIST_PATTERNS:
+        if pattern in url_lower:
+            return True
+    # Allow the initial navigation document request
+    if url_lower.rstrip("/") == "https://www.neverbounce.com":
+        return True
+    return False
 
 
 def validate_email(email: str) -> bool:
@@ -66,9 +84,17 @@ async def verify_email_in_page_async(
     timeout_ms: int = 28000,
 ) -> Dict[str, Any]:
     """
-    Executes an IP-consistent NeverBounce deliverability verification natively
-    using Scrapling's AsyncStealthySession with pre-navigation domain blocking and asset aborting.
+    Bandwidth-optimized NeverBounce email verification.
+
+    Uses a WHITELIST-ONLY routing strategy:
+    - Block ALL requests by default (Next.js bundles, CSS, images, trackers → 0 bytes)
+    - Only allow: HTML document, PerimeterX sensor scripts, and /api/emailcheck
+    - PX captcha.js and px.js are served from RAM cache after first download
+
+    Expected bandwidth: ~50-80 KB per email (down from ~850 KB).
     """
+    global CACHED_PX_SENSOR
+
     clean_email = email.strip()
     result_holder: Dict[str, Any] = {
         "email": clean_email,
@@ -77,13 +103,13 @@ async def verify_email_in_page_async(
         "flags": [],
         "latency_seconds": 0.0,
         "transfer_bytes": 0,
-        "method": "async_stealth_in_page",
+        "method": "whitelist_stealth_in_page",
         "error": None,
     }
 
     t0 = time.time()
     extracted_data: Dict[str, Any] = {}
-    wire_bytes = 0
+    wire_bytes = 0  # Only counts bytes that actually went through the proxy
 
     session_kwargs: Dict[str, Any] = {
         "headless": True,
@@ -95,10 +121,16 @@ async def verify_email_in_page_async(
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
             async def on_page(page):
-                nonlocal wire_bytes
+                nonlocal wire_bytes, CACHED_PX_SENSOR
+
+                # Track only actual wire bytes (not RAM-fulfilled responses)
+                ram_fulfilled_urls = set()
 
                 async def on_resp(resp):
                     nonlocal wire_bytes
+                    # Skip bandwidth counting for RAM-fulfilled responses
+                    if resp.url in ram_fulfilled_urls:
+                        return
                     try:
                         b = await resp.body()
                         wire_bytes += len(b)
@@ -108,8 +140,13 @@ async def verify_email_in_page_async(
                 page.on("response", on_resp)
 
                 async def route_handler(route):
-                    url = route.request.url.lower()
-                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                    nonlocal CACHED_PX_SENSOR
+                    url = route.request.url
+                    url_lower = url.lower()
+
+                    # 1. Serve captcha.js from RAM (zero bandwidth)
+                    if "captcha.js" in url_lower and CACHED_CAPTCHA_JS:
+                        ram_fulfilled_urls.add(url)
                         await route.fulfill(
                             status=200,
                             content_type="application/javascript",
@@ -118,16 +155,41 @@ async def verify_email_in_page_async(
                         )
                         return
 
-                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
-                        t in url for t in BLOCKED_DOMAINS
-                    ):
-                        await route.abort()
-                    else:
+                    # 2. Serve PX sensor from RAM if cached (zero bandwidth)
+                    if "/px.js" in url_lower and CACHED_PX_SENSOR:
+                        ram_fulfilled_urls.add(url)
+                        await route.fulfill(
+                            status=200,
+                            content_type="application/javascript",
+                            body=CACHED_PX_SENSOR,
+                            headers={"Access-Control-Allow-Origin": "*"},
+                        )
+                        return
+
+                    # 3. WHITELIST CHECK: only allow essential requests
+                    if _is_whitelisted(url):
                         await route.continue_()
+                    else:
+                        # Block everything not whitelisted (Next.js bundles, CSS, etc.)
+                        await route.abort()
 
                 await page.route("**/*", route_handler)
 
-                # In-page script: waits up to 3.5s for PerimeterX _pxhd cookie before firing fetch
+                # After PX sensor loads for the first time, cache it for future sessions
+                async def cache_px_sensor(resp):
+                    nonlocal CACHED_PX_SENSOR
+                    if CACHED_PX_SENSOR is None and "/px.js" in resp.url.lower():
+                        try:
+                            body = await resp.body()
+                            if len(body) > 1000:  # Sanity check: real PX sensor is >10KB
+                                CACHED_PX_SENSOR = body
+                                logger.info("Cached PX sensor script (%d bytes) for future sessions.", len(body))
+                        except Exception:
+                            pass
+
+                page.on("response", cache_px_sensor)
+
+                # In-page script: waits for PerimeterX _pxhd cookie, then fires emailcheck
                 js_script = f"""
                 async () => {{
                     try {{
@@ -160,7 +222,6 @@ async def verify_email_in_page_async(
                 page_action=on_page,
                 timeout=timeout_ms,
                 disable_resources=True,
-                blocked_domains=BLOCKED_DOMAINS,
             )
 
         status_code = extracted_data.get("status_code", 0)
@@ -219,7 +280,7 @@ class NeverbounceVerifier:
                 "flags": res.get("flags", []),
             },
             "transfer_bytes": res.get("transfer_bytes", 0),
-            "method": res.get("method", "async_stealth_in_page"),
+            "method": res.get("method", "whitelist_stealth_in_page"),
             "error": res.get("error"),
         }
 

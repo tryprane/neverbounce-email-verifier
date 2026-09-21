@@ -122,7 +122,7 @@ async def verify_single_email_with_retries(
 ) -> Dict[str, Any]:
     """
     Verifies a single email with automatic proxy rotation across retry attempts.
-    Guarantees 100% PerimeterX IP consistency and minimal bandwidth (~10.8 KB/mail).
+    Uses whitelist-only routing for minimal bandwidth (~50-80 KB/mail).
     """
     async with (semaphore or asyncio.Lock()):
         start_time = time.monotonic()
@@ -159,7 +159,7 @@ async def verify_single_email_with_retries(
                         "has_dns": parsed_flags["has_dns"],
                         "has_dns_mx": parsed_flags["has_dns_mx"],
                         "historical_response": parsed_flags["historical_response"],
-                        "verification_method": "prefetched_stealth_in_page",
+                        "verification_method": "whitelist_stealth_in_page",
                         "transfer_bytes": total_transfer_bytes,
                         "proxy_session": session_id,
                         "attempts": attempt,

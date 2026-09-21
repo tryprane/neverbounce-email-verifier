@@ -121,7 +121,8 @@ async def verify_email_in_page_async(
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
             async def on_page(page):
-                nonlocal wire_bytes, CACHED_PX_SENSOR
+                nonlocal wire_bytes
+                global CACHED_PX_SENSOR
 
                 # Track only actual wire bytes (not RAM-fulfilled responses)
                 ram_fulfilled_urls = set()
@@ -140,7 +141,7 @@ async def verify_email_in_page_async(
                 page.on("response", on_resp)
 
                 async def route_handler(route):
-                    nonlocal CACHED_PX_SENSOR
+                    global CACHED_PX_SENSOR
                     url = route.request.url
                     url_lower = url.lower()
 
@@ -177,7 +178,7 @@ async def verify_email_in_page_async(
 
                 # After PX sensor loads for the first time, cache it for future sessions
                 async def cache_px_sensor(resp):
-                    nonlocal CACHED_PX_SENSOR
+                    global CACHED_PX_SENSOR
                     if CACHED_PX_SENSOR is None and "/px.js" in resp.url.lower():
                         try:
                             body = await resp.body()

@@ -133,11 +133,20 @@ async def verify_email_in_page_async(
                     if resp.url in ram_fulfilled_urls:
                         return
                     try:
-                        b = await resp.body()
-                        size = len(b)
+                        # Try to get size from content-length header first
+                        cl = resp.headers.get("content-length")
+                        if cl and cl.isdigit():
+                            size = int(cl)
+                        else:
+                            # Fallback: try to read body
+                            try:
+                                b = await resp.body()
+                                size = len(b)
+                            except Exception:
+                                size = 0
                         wire_bytes += size
-                        if size > 500:  # Log any response over 500 bytes
-                            logger.info("WIRE: %d B (%s) %s", size, resp.status, resp.url[:120])
+                        if size > 100:
+                            logger.info("WIRE: %d B | %s | %s", size, resp.status, resp.url[:120])
                     except Exception:
                         pass
 

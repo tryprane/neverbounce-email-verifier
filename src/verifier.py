@@ -132,7 +132,16 @@ async def verify_email_in_page_async(
 
                 page.on("response", on_resp)
 
-            # Route handler attached BEFORE page.goto() — blocks 100% of Next.js chunks, GTM, etc.
+            # Route handler: Allow main document, Next.js chunks (needed for PX init), PX endpoints, and emailcheck.
+            # Abort heavy tracking domains, fonts, images, media, and stylesheets.
+            BLOCKED_DOMAINS = {
+                "zoominfo.com", "googleads.g.doubleclick.net", "facebook.com",
+                "datadoghq.com", "fonts.googleapis.com", "fonts.gstatic.com",
+                "ada.support", "clarity.ms", "hubspot.com", "analytics.google.com",
+                "googletagmanager.com", "connect.facebook.net", "bat.bing.com",
+                "cookielaw.org"
+            }
+
             async def route_handler(route):
                 global CACHED_PX_SENSOR
                 url = route.request.url
@@ -150,63 +159,29 @@ async def verify_email_in_page_async(
                     )
                     return
 
-                # 2. Serve PX sensor from RAM if cached (0 bytes wire bandwidth)
-                if "/px.js" in url_lower and CACHED_PX_SENSOR:
-                    ram_fulfilled_urls.add(url)
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_PX_SENSOR,
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
+                # 2. Block heavy resources and third-party trackers
+                if rtype in ["image", "media", "font", "stylesheet"] or any(d in url_lower for d in BLOCKED_DOMAINS):
+                    await route.abort()
                     return
 
-                # 3. Whitelist: Only allow NeverBounce main document, PerimeterX, and emailcheck
-                is_main_doc = rtype == "document" and "neverbounce.com" in url_lower
-                is_emailcheck = "/api/emailcheck" in url_lower
-                is_px_endpoint = any(k in url_lower for k in [
-                    "/btfn1q7w/",
-                    "/px/",
-                    "/b/s/",
-                    "collector-px",
-                    "client.perimeterx.net",
-                    "px-cloud.net",
-                    "/px.js",
-                ])
-
-                if is_main_doc or is_emailcheck or is_px_endpoint:
-                    await route.continue_()
-                else:
-                    # Instantly abort all Next.js bundles, GTM, OneTrust, images, CSS
-                    await route.abort()
+                # 3. Allow essential application and PerimeterX scripts
+                await route.continue_()
 
             await page.route("**/*", route_handler)
 
-            # After PX sensor loads for the first time, cache it for future sessions
-            async def cache_px_sensor(resp):
-                global CACHED_PX_SENSOR
-                if CACHED_PX_SENSOR is None and "/px.js" in resp.url.lower():
-                    try:
-                        body = await resp.body()
-                        if len(body) > 1000:
-                            CACHED_PX_SENSOR = body
-                            logger.info("Cached PX sensor script (%d bytes) for future sessions.", len(body))
-                    except Exception:
-                        pass
+            # Navigate to NeverBounce home and wait for DOM to be ready
+            await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            page.on("response", cache_px_sensor)
-
-            # Navigate to NeverBounce home
-            await page.goto(NEVERBOUNCE_HOME, wait_until="commit", timeout=timeout_ms)
-
-            # In-page script: waits for PerimeterX _pxhd cookie, then fires emailcheck
+            # In-page script: waits for PerimeterX _pxhd cookie and sensor handshake, then fires emailcheck
             js_script = f"""
             async () => {{
                 try {{
                     const start = Date.now();
-                    while (!document.cookie.includes('_pxhd') && (Date.now() - start < 6000)) {{
+                    while (!document.cookie.includes('_pxhd') && (Date.now() - start < 8000)) {{
                         await new Promise(r => setTimeout(r, 100));
                     }}
+                    // Stabilization delay to allow PerimeterX sensor telemetry to fire
+                    await new Promise(r => setTimeout(r, 800));
                     const response = await fetch('/api/emailcheck', {{
                         method: 'POST',
                         headers: {{
@@ -227,7 +202,7 @@ async def verify_email_in_page_async(
             eval_res = await page.evaluate(js_script)
             extracted_data.update(eval_res)
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
             await page.close()
 
         status_code = extracted_data.get("status_code", 0)

@@ -132,7 +132,7 @@ async def verify_email_in_page_async(
                 async () => {{
                     try {{
                         const start = Date.now();
-                        while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
+                        while (!document.cookie.includes('_pxhd') && (Date.now() - start < 6000)) {{
                             await new Promise(r => setTimeout(r, 150));
                         }}
                         const response = await fetch('/api/emailcheck', {{

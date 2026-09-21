@@ -97,6 +97,9 @@ async def verify_email_in_page_async(
 
                 await page.route("**/*", route_handler)
 
+                # Wait for page scripts and PerimeterX sensor to fully stabilize
+                await asyncio.sleep(3.5)
+
                 # In-page script: waits up to 3.5s for PerimeterX _pxhd cookie before firing fetch
                 js_script = f"""
                 async () => {{
@@ -105,6 +108,8 @@ async def verify_email_in_page_async(
                         while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
                             await new Promise(r => setTimeout(r, 150));
                         }}
+                        // Small human typing delay
+                        await new Promise(r => setTimeout(r, 500));
                         const response = await fetch('/api/emailcheck', {{
                             method: 'POST',
                             headers: {{

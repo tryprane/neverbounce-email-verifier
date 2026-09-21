@@ -14,6 +14,7 @@ from src.verifier import (
     parse_flags,
     validate_email,
     verify_email_in_page_async,
+    verify_emails_in_session_async,
 )
 
 EMAIL_EXTRACT_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
@@ -112,106 +113,137 @@ class ProxyRotator:
         return None, "direct"
 
 
-async def verify_single_email_with_retries(
-    email: str,
-    email_index: int,
+async def verify_batch_with_retries(
+    batch_emails: List[str],
+    batch_offset: int,
     total_emails: int,
     proxy_rotator: ProxyRotator,
-    max_retries: int = 2,
+    max_retries: int = 3,
     semaphore: Optional[asyncio.Semaphore] = None,
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
-    Verifies a single email with automatic proxy rotation across retry attempts.
-    Uses whitelist-only routing for minimal bandwidth (~50-80 KB/mail).
+    Verifies a batch of emails inside an authenticated stealth browser session.
+    Automatically rotates proxy session and retries any rate-limited or aborted emails.
     """
     async with (semaphore or asyncio.Lock()):
-        start_time = time.monotonic()
-        last_error = None
+        pending_emails = list(batch_emails)
+        resolved_results: Dict[str, Dict[str, Any]] = {}
         last_session = "none"
-        total_transfer_bytes = 0
 
         for attempt in range(1, max_retries + 1):
-            proxy_url, session_id = await proxy_rotator.get_proxy_for_attempt(email, attempt)
+            if not pending_emails:
+                break
+
+            proxy_url, session_id = await proxy_rotator.get_proxy_for_attempt(pending_emails[0], attempt)
             last_session = session_id
 
             try:
-                res = await verify_email_in_page_async(
-                    email=email,
+                batch_res = await verify_emails_in_session_async(
+                    emails=pending_emails,
                     proxy_url=proxy_url,
-                    timeout_ms=28000,
+                    timeout_ms=35000 + (len(pending_emails) * 3000),
                 )
-                total_transfer_bytes += res.get("transfer_bytes", 0)
 
-                if res.get("success"):
-                    st = res.get("status", "unknown").lower()
-                    flags = res.get("flags", [])
-                    parsed_flags = parse_flags(flags)
-                    latency = round(time.monotonic() - start_time, 2)
+                still_unresolved = []
+                for item in batch_res:
+                    em = item["email"]
+                    if item.get("success"):
+                        st = item.get("status", "unknown").lower()
+                        flags = item.get("flags", [])
+                        parsed = parse_flags(flags)
+                        rec = {
+                            "email": em,
+                            "status": st,
+                            "is_valid": st == "valid",
+                            "flags": flags,
+                            "free_email": parsed["free_email"],
+                            "role_account": parsed["role_account"],
+                            "smtp_connectable": parsed["smtp_connectable"],
+                            "has_dns": parsed["has_dns"],
+                            "has_dns_mx": parsed["has_dns_mx"],
+                            "historical_response": parsed["historical_response"],
+                            "verification_method": "stealth_session_batch",
+                            "transfer_bytes": item.get("transfer_bytes", 0),
+                            "proxy_session": session_id,
+                            "attempts": attempt,
+                            "latency_seconds": item.get("latency_seconds", 0.0),
+                            "error": None,
+                        }
+                        resolved_results[em] = rec
+                        idx_num = batch_offset + batch_emails.index(em) + 1
+                        Actor.log.info(
+                            f"[{idx_num:03d}/{total_emails:03d}] {em:<34} -> {st.upper():<9} "
+                            f"({item.get('latency_seconds')}s, session: {session_id})"
+                        )
+                        await Actor.push_data(rec)
+                    else:
+                        err = item.get("error")
+                        if err in ("RATE_LIMITED_429", "BOT_CHALLENGE_403", "SESSION_ABORTED") or "FetchException" in str(err):
+                            still_unresolved.append(em)
+                        else:
+                            rec = {
+                                "email": em,
+                                "status": "unknown",
+                                "is_valid": False,
+                                "flags": [],
+                                "free_email": False,
+                                "role_account": False,
+                                "smtp_connectable": False,
+                                "has_dns": False,
+                                "has_dns_mx": False,
+                                "historical_response": False,
+                                "verification_method": "stealth_session_batch",
+                                "transfer_bytes": item.get("transfer_bytes", 0),
+                                "proxy_session": session_id,
+                                "attempts": attempt,
+                                "latency_seconds": item.get("latency_seconds", 0.0),
+                                "error": err or "Verification error",
+                            }
+                            resolved_results[em] = rec
+                            idx_num = batch_offset + batch_emails.index(em) + 1
+                            Actor.log.warning(
+                                f"[{idx_num:03d}/{total_emails:03d}] {em:<34} -> UNKNOWN ({err})"
+                            )
+                            await Actor.push_data(rec)
 
-                    result_record = {
-                        "email": email,
-                        "status": st,
-                        "is_valid": st == "valid",
-                        "flags": flags,
-                        "free_email": parsed_flags["free_email"],
-                        "role_account": parsed_flags["role_account"],
-                        "smtp_connectable": parsed_flags["smtp_connectable"],
-                        "has_dns": parsed_flags["has_dns"],
-                        "has_dns_mx": parsed_flags["has_dns_mx"],
-                        "historical_response": parsed_flags["historical_response"],
-                        "verification_method": "whitelist_stealth_in_page",
-                        "transfer_bytes": total_transfer_bytes,
-                        "proxy_session": session_id,
-                        "attempts": attempt,
-                        "latency_seconds": latency,
-                        "error": None,
-                    }
-
-                    Actor.log.info(
-                        f"[{email_index:03d}/{total_emails:03d}] {email:<32} "
-                        f"-> {st.upper():<9} ({latency}s, session: {session_id})"
+                pending_emails = still_unresolved
+                if pending_emails and attempt < max_retries:
+                    Actor.log.warning(
+                        f"Rotating proxy session for {len(pending_emails)} remaining emails in batch (attempt {attempt + 1}/{max_retries})..."
                     )
-                    return result_record
-
-                # If rate-limited (429) or challenged (403), rotate proxy
-                err_msg = res.get("error") or "Unknown error"
-                Actor.log.warning(
-                    f"[{email_index:03d}/{total_emails:03d}] {email} attempt {attempt}/{max_retries} "
-                    f"returned {err_msg}. Rotating proxy session..."
-                )
-                last_error = err_msg
+                    await asyncio.sleep(1.0)
 
             except Exception as e:
-                Actor.log.warning(
-                    f"[{email_index:03d}/{total_emails:03d}] {email} attempt {attempt} error: {e}. Rotating proxy..."
-                )
-                last_error = str(e)
+                Actor.log.warning(f"Batch attempt {attempt} error: {e}. Rotating proxy...")
+                if attempt < max_retries:
+                    await asyncio.sleep(1.0)
 
-            if attempt < max_retries:
-                await asyncio.sleep(1.0)
+        # For any emails that exhausted all retries
+        for em in pending_emails:
+            rec = {
+                "email": em,
+                "status": "unknown",
+                "is_valid": False,
+                "flags": [],
+                "free_email": False,
+                "role_account": False,
+                "smtp_connectable": False,
+                "has_dns": False,
+                "has_dns_mx": False,
+                "historical_response": False,
+                "verification_method": "failed",
+                "transfer_bytes": 0,
+                "proxy_session": last_session,
+                "attempts": max_retries,
+                "latency_seconds": 0.0,
+                "error": "Max retries exceeded",
+            }
+            resolved_results[em] = rec
+            idx_num = batch_offset + batch_emails.index(em) + 1
+            Actor.log.error(f"[{idx_num:03d}/{total_emails:03d}] {em:<34} -> FAILED (Max retries exceeded)")
+            await Actor.push_data(rec)
 
-        # All retries exhausted
-        latency = round(time.monotonic() - start_time, 2)
-        Actor.log.error(f"[{email_index:03d}/{total_emails:03d}] {email} failed after {max_retries} attempts: {last_error}")
-
-        return {
-            "email": email,
-            "status": "unknown",
-            "is_valid": False,
-            "flags": [],
-            "free_email": False,
-            "role_account": False,
-            "smtp_connectable": False,
-            "has_dns": False,
-            "has_dns_mx": False,
-            "historical_response": False,
-            "verification_method": "failed",
-            "transfer_bytes": total_transfer_bytes,
-            "proxy_session": last_session,
-            "attempts": max_retries,
-            "latency_seconds": latency,
-            "error": last_error or "Max retries exceeded",
-        }
+        return [resolved_results[em] for em in batch_emails if em in resolved_results]
 
 
 async def main():
@@ -232,30 +264,29 @@ async def main():
 
         Actor.log.info(f"Loaded {len(emails)} unique target email(s) for verification.")
 
-        # 2. Concurrency & Retry bounds
+        # 2. Concurrency, Batch size & Retry bounds
         concurrency = int(actor_input.get("max_concurrency") or 1)
-        concurrency = max(1, min(10, concurrency))  # Bounded between 1 and 10
-        max_retries = int(actor_input.get("max_retries") or 2)
+        concurrency = max(1, min(10, concurrency))
+        max_retries = int(actor_input.get("max_retries") or 3)
         max_retries = max(1, min(5, max_retries))
+        batch_size = int(actor_input.get("batch_size") or 5)
+        batch_size = max(1, min(10, batch_size))
 
         # 3. Setup Proxy Rotator
         apify_proxy_config = None
         proxy_input = actor_input.get("proxyConfiguration")
 
-        # Extract custom proxies if provided
         custom_proxies: List[str] = []
         if actor_input.get("custom_proxies") and isinstance(actor_input.get("custom_proxies"), list):
             custom_proxies.extend(actor_input.get("custom_proxies"))
         if actor_input.get("proxy_url") and isinstance(actor_input.get("proxy_url"), str):
             custom_proxies.append(actor_input.get("proxy_url"))
 
-        # Initialize Apify Proxy if custom proxies not explicitly configured
         if not custom_proxies:
             try:
                 if proxy_input:
                     apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
                 else:
-                    # Auto-fallback: try residential, then datacenter, then default
                     try:
                         apify_proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"])
                         Actor.log.info("Initialized Apify Residential Proxy pool.")
@@ -272,28 +303,29 @@ async def main():
 
         proxy_type = "Custom Proxy Pool" if custom_proxies else ("Apify Proxy" if apify_proxy_config else "Direct Egress")
         Actor.log.info(
-            f"Configuration: Concurrency={concurrency} workers | Retries={max_retries} | Proxy Mode={proxy_type}"
+            f"Configuration: Concurrency={concurrency} workers | Session Batch Size={batch_size} | "
+            f"Retries={max_retries} | Proxy Mode={proxy_type}"
         )
 
-        # 4. Process all emails concurrently with controlled concurrency
+        # 4. Partition emails into session batches
+        chunks = [emails[i : i + batch_size] for i in range(0, len(emails), batch_size)]
         semaphore = asyncio.Semaphore(concurrency)
         start_run = time.time()
         results: List[Dict[str, Any]] = []
 
-        async def worker(em: str, idx: int):
-            record = await verify_single_email_with_retries(
-                email=em,
-                email_index=idx,
+        async def batch_worker(chunk: List[str], chunk_idx: int):
+            offset = chunk_idx * batch_size
+            chunk_results = await verify_batch_with_retries(
+                batch_emails=chunk,
+                batch_offset=offset,
                 total_emails=len(emails),
                 proxy_rotator=proxy_rotator,
                 max_retries=max_retries,
                 semaphore=semaphore,
             )
-            # Push immediately to dataset so user sees live streaming results
-            await Actor.push_data(record)
-            results.append(record)
+            results.extend(chunk_results)
 
-        tasks = [worker(email, idx) for idx, email in enumerate(emails, 1)]
+        tasks = [batch_worker(chunk, c_idx) for c_idx, chunk in enumerate(chunks)]
         await asyncio.gather(*tasks)
 
         total_time = round(time.time() - start_run, 2)
@@ -325,17 +357,16 @@ async def main():
             "avg_latency_seconds": round(total_time / len(results), 2) if results else 0.0,
         }
 
-        # Save summary to Key-Value Store
         await Actor.set_value("OUTPUT", summary)
 
         Actor.log.info("=" * 60)
         Actor.log.info("   NEVERBOUNCE VERIFICATION RUN COMPLETED   ")
         Actor.log.info("=" * 60)
         Actor.log.info(f"Total Processed:       {len(results)}")
-        Actor.log.info(f"Valid (Deliverable):   {valid_count} ({round(valid_count/len(results)*100, 1)}%)")
-        Actor.log.info(f"Catch-all:             {catchall_count} ({round(catchall_count/len(results)*100, 1)}%)")
-        Actor.log.info(f"Unknown (Protected):   {unknown_count} ({round(unknown_count/len(results)*100, 1)}%)")
-        Actor.log.info(f"Failed / Timeout:      {failed_count} ({round(failed_count/len(results)*100, 1)}%)")
+        Actor.log.info(f"Valid (Deliverable):   {valid_count} ({round(valid_count/len(results)*100, 1) if results else 0}%)")
+        Actor.log.info(f"Catch-all:             {catchall_count} ({round(catchall_count/len(results)*100, 1) if results else 0}%)")
+        Actor.log.info(f"Unknown (Protected):   {unknown_count} ({round(unknown_count/len(results)*100, 1) if results else 0}%)")
+        Actor.log.info(f"Failed / Timeout:      {failed_count} ({round(failed_count/len(results)*100, 1) if results else 0}%)")
         Actor.log.info(f"Total Bandwidth:       {total_mb} MB (~{avg_bandwidth_kb} KB/email)")
         Actor.log.info(f"Total Run Time:        {total_time}s ({round(total_time/60, 2)} min)")
         Actor.log.info("=" * 60)

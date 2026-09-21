@@ -134,7 +134,10 @@ async def verify_email_in_page_async(
                         return
                     try:
                         b = await resp.body()
-                        wire_bytes += len(b)
+                        size = len(b)
+                        wire_bytes += size
+                        if size > 500:  # Log any response over 500 bytes
+                            logger.info("WIRE: %d B (%s) %s", size, resp.status, resp.url[:120])
                     except Exception:
                         pass
 

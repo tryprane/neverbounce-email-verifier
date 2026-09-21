@@ -25,10 +25,8 @@ EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
 BLOCKED_TRACKERS = {
     "zoominfo.com", "googleads.g.doubleclick.net", "facebook.com",
-    "datadoghq.com", "fonts.googleapis.com", "fonts.gstatic.com",
-    "ada.support", "clarity.ms", "hubspot.com", "analytics.google.com",
-    "googletagmanager.com", "connect.facebook.net", "bat.bing.com",
-    "cookielaw.org"
+    "datadoghq.com", "ada.support", "clarity.ms", "hubspot.com",
+    "analytics.google.com", "connect.facebook.net", "bat.bing.com",
 }
 
 
@@ -141,11 +139,6 @@ async def verify_emails_in_session_async(
                         try {{
                             const response = await fetch('/api/emailcheck', {{
                                 method: 'POST',
-                                headers: {{
-                                    'Content-Type': 'text/plain;charset=UTF-8',
-                                    'Origin': 'https://www.neverbounce.com',
-                                    'Referer': 'https://www.neverbounce.com/'
-                                }},
                                 body: JSON.stringify({{ email: {json.dumps(em)} }})
                             }});
                             const status = response.status;
@@ -174,14 +167,15 @@ async def verify_emails_in_session_async(
                             res["error"] = f"JSONDecodeError: {parse_err}"
                     elif sc == 429:
                         res["error"] = "RATE_LIMITED_429"
-                        logger.warning("NeverBounce session rate-limited (429) on %s. Rotating proxy session...", em)
-                        break  # Stop remaining emails in this session so they get a fresh proxy
+                        logger.warning("NeverBounce session rate-limited (429) on %s. Body: %s", em, body[:250])
+                        break
                     elif sc == 403:
                         res["error"] = "BOT_CHALLENGE_403"
-                        logger.warning("NeverBounce session challenged (403) on %s. Rotating proxy session...", em)
+                        logger.warning("NeverBounce session 403 on %s. Body: %s", em, body[:250])
                         break
                     else:
                         res["error"] = f"HTTP_{sc}: {body[:60]}"
+                        logger.warning("NeverBounce HTTP %d on %s. Body: %s", sc, em, body[:250])
                         if sc >= 400:
                             break
 

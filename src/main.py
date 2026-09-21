@@ -140,7 +140,7 @@ async def verify_single_email_with_retries(
                     proxy_url=proxy_url,
                     timeout_ms=28000,
                 )
-                total_transfer_bytes += res.get("transfer_bytes", 10800)
+                total_transfer_bytes += res.get("transfer_bytes", 0)
 
                 if res.get("success"):
                     st = res.get("status", "unknown").lower()
@@ -159,7 +159,7 @@ async def verify_single_email_with_retries(
                         "has_dns": parsed_flags["has_dns"],
                         "has_dns_mx": parsed_flags["has_dns_mx"],
                         "historical_response": parsed_flags["historical_response"],
-                        "verification_method": "stealth_in_page",
+                        "verification_method": "prefetched_stealth_in_page",
                         "transfer_bytes": total_transfer_bytes,
                         "proxy_session": session_id,
                         "attempts": attempt,

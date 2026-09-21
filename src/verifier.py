@@ -6,36 +6,38 @@ import pathlib
 import re
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
-
-from playwright.async_api import async_playwright
+from scrapling.fetchers import AsyncStealthySession
 
 logger = logging.getLogger(__name__)
 
-# Pre-load all static NeverBounce & PerimeterX scripts from RAM
-ASSETS_DIR = pathlib.Path(__file__).parent / "assets"
-CACHED_SCRIPTS: Dict[str, bytes] = {}
-for fname in ["captcha.js", "auditor.js", "main.min.js", "index.js"]:
-    fpath = ASSETS_DIR / fname
-    if fpath.exists():
-        try:
-            CACHED_SCRIPTS[fname] = fpath.read_bytes()
-            logger.info("Loaded pre-cached %s (%d bytes).", fname, len(CACHED_SCRIPTS[fname]))
-        except Exception as e:
-            logger.warning("Failed to load %s: %s", fname, e)
-
-# Self-contained stealth scripts for Chromium evasion
-STEALTH_JS: Optional[str] = None
-STEALTH_PATH = ASSETS_DIR / "stealth.js"
-if STEALTH_PATH.exists():
+# Pre-cached static PerimeterX captcha.js
+CAPTCHA_JS_PATH = pathlib.Path(__file__).parent / "assets" / "captcha.js"
+CACHED_CAPTCHA_JS: Optional[bytes] = None
+if CAPTCHA_JS_PATH.exists():
     try:
-        STEALTH_JS = STEALTH_PATH.read_text(encoding="utf-8")
-        logger.info("Loaded self-contained stealth.js (%d bytes).", len(STEALTH_JS))
+        CACHED_CAPTCHA_JS = CAPTCHA_JS_PATH.read_bytes()
+        logger.info("Loaded cached PerimeterX captcha.js (%d bytes).", len(CACHED_CAPTCHA_JS))
     except Exception as e:
-        logger.warning("Failed to load stealth.js: %s", e)
+        logger.warning("Failed to load cached captcha.js: %s", e)
 
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+BLOCKED_DOMAINS = {
+    "zoominfo.com",
+    "googleads.g.doubleclick.net",
+    "facebook.com",
+    "datadoghq.com",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+    "ada.support",
+    "clarity.ms",
+    "hubspot.com",
+    "analytics.google.com",
+    "googletagmanager.com",
+    "connect.facebook.net",
+    "bat.bing.com",
+}
 
 
 def validate_email(email: str) -> bool:
@@ -64,14 +66,8 @@ async def verify_email_in_page_async(
     timeout_ms: int = 28000,
 ) -> Dict[str, Any]:
     """
-    Executes an IP-consistent NeverBounce deliverability verification natively using Playwright
-    with pre-navigation RAM fulfillment of PerimeterX assets.
-    
-    Guarantees:
-    1. Pre-navigation Route Interception: All 4 heavy JS scripts (2.3+ MB) are fulfilled from RAM.
-    2. Fonts, stylesheets, images, and 3rd party trackers are aborted before hitting the wire.
-    3. 100% PerimeterX IP consistency (fetch executed inside active TLS session).
-    4. Minimal bandwidth on the wire (~11-15 KB total per email check).
+    Executes an IP-consistent NeverBounce deliverability verification natively
+    using Scrapling's AsyncStealthySession with pre-navigation domain blocking and asset aborting.
     """
     clean_email = email.strip()
     result_holder: Dict[str, Any] = {
@@ -81,150 +77,91 @@ async def verify_email_in_page_async(
         "flags": [],
         "latency_seconds": 0.0,
         "transfer_bytes": 0,
-        "method": "prefetched_stealth_in_page",
+        "method": "async_stealth_in_page",
         "error": None,
     }
 
     t0 = time.time()
     extracted_data: Dict[str, Any] = {}
-    actual_wire_bytes = 0
+    wire_bytes = 0
 
-    # Parse proxy configuration if provided
-    proxy_dict = None
+    session_kwargs: Dict[str, Any] = {
+        "headless": True,
+        "disable_resources": True,
+    }
     if proxy_url:
-        parsed = urlparse(proxy_url)
-        proxy_dict = {
-            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-        }
-        if parsed.username:
-            proxy_dict["username"] = parsed.username
-        if parsed.password:
-            proxy_dict["password"] = parsed.password
+        session_kwargs["proxy"] = proxy_url
 
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-background-networking",
-                    "--disable-backgrounding-occluded-windows",
-                ],
-            )
+        async with AsyncStealthySession(**session_kwargs) as session:
+            async def on_page(page):
+                nonlocal wire_bytes
 
-            context = await browser.new_context(
-                proxy=proxy_dict,
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                color_scheme="dark",
-                ignore_https_errors=True,
-            )
-
-            # Inject self-contained stealth scripts
-            if STEALTH_JS:
-                await context.add_init_script(script=STEALTH_JS)
-
-            # PRE-NAVIGATION ROUTE INTERCEPTION:
-            # Fulfill all static heavy scripts directly from RAM and abort trackers
-            async def route_handler(route):
-                url = route.request.url.lower()
-                rtype = route.request.resource_type
-
-                # 1. Fulfill pre-cached PerimeterX & NeverBounce scripts directly from RAM (0 proxy bytes)
-                if "captcha.js" in url and "captcha.js" in CACHED_SCRIPTS:
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_SCRIPTS["captcha.js"],
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
-                    return
-                if "auditor.js" in url and "auditor.js" in CACHED_SCRIPTS:
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_SCRIPTS["auditor.js"],
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
-                    return
-                if "main.min.js" in url and "main.min.js" in CACHED_SCRIPTS:
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_SCRIPTS["main.min.js"],
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
-                    return
-                if "ri.px-cloud.net/index.js" in url and "index.js" in CACHED_SCRIPTS:
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_SCRIPTS["index.js"],
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
-                    return
-
-                # 2. Abort all unnecessary heavy resources and 3rd party trackers
-                if rtype in ["image", "media", "font", "stylesheet"] or any(
-                    t in url for t in ["zoominfo", "googleads", "facebook", "datadog", "analytics", "ada", "clarity", "hubspot", "segment"]
-                ):
-                    await route.abort()
-                    return
-
-                # 3. Allow only document, telemetry handshakes, and emailcheck
-                await route.continue_()
-
-            await context.route("**/*", route_handler)
-
-            # Track actual wire bytes downloaded over the proxy
-            async def on_resp(resp):
-                nonlocal actual_wire_bytes
-                u = resp.url.lower()
-                # Exclude local RAM fulfillments from wire count
-                if not any(k in u for k in ["captcha.js", "auditor.js", "main.min.js", "ri.px-cloud.net/index.js"]):
+                async def on_resp(resp):
+                    nonlocal wire_bytes
                     try:
                         b = await resp.body()
-                        actual_wire_bytes += len(b)
+                        wire_bytes += len(b)
                     except Exception:
                         pass
 
-            page = await context.new_page()
-            page.on("response", on_resp)
+                page.on("response", on_resp)
 
-            # Navigate to NeverBounce home
-            await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
+                async def route_handler(route):
+                    url = route.request.url.lower()
+                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                        await route.fulfill(
+                            status=200,
+                            content_type="application/javascript",
+                            body=CACHED_CAPTCHA_JS,
+                            headers={"Access-Control-Allow-Origin": "*"},
+                        )
+                        return
 
-            # Wait up to 3.5s for PerimeterX _pxhd cookie before firing in-page fetch
-            js_script = f"""
-            async () => {{
-                try {{
-                    const start = Date.now();
-                    while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
-                        await new Promise(r => setTimeout(r, 150));
+                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                        t in url for t in BLOCKED_DOMAINS
+                    ):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/*", route_handler)
+
+                # In-page script: waits up to 3.5s for PerimeterX _pxhd cookie before firing fetch
+                js_script = f"""
+                async () => {{
+                    try {{
+                        const start = Date.now();
+                        while (!document.cookie.includes('_pxhd') && (Date.now() - start < 3500)) {{
+                            await new Promise(r => setTimeout(r, 150));
+                        }}
+                        const response = await fetch('/api/emailcheck', {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'text/plain;charset=UTF-8',
+                                'Origin': 'https://www.neverbounce.com',
+                                'Referer': 'https://www.neverbounce.com/'
+                            }},
+                            body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
+                        }});
+                        const status = response.status;
+                        const text = await response.text();
+                        return {{ status_code: status, body: text }};
+                    }} catch (err) {{
+                        return {{ status_code: 0, body: String(err) }};
                     }}
-                    const response = await fetch('/api/emailcheck', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'text/plain;charset=UTF-8',
-                            'Origin': 'https://www.neverbounce.com',
-                            'Referer': 'https://www.neverbounce.com/'
-                        }},
-                        body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
-                    }});
-                    const status = response.status;
-                    const text = await response.text();
-                    return {{ status_code: status, body: text }};
-                }} catch (err) {{
-                    return {{ status_code: 0, body: String(err) }};
                 }}
-            }}
-            """
-            eval_res = await page.evaluate(js_script)
-            extracted_data.update(eval_res)
+                """
+                eval_res = await page.evaluate(js_script)
+                extracted_data.update(eval_res)
 
-            await browser.close()
+            await session.fetch(
+                NEVERBOUNCE_HOME,
+                page_action=on_page,
+                timeout=timeout_ms,
+                disable_resources=True,
+                blocked_domains=BLOCKED_DOMAINS,
+            )
 
         status_code = extracted_data.get("status_code", 0)
         raw_body = extracted_data.get("body", "")
@@ -248,7 +185,7 @@ async def verify_email_in_page_async(
     except Exception as fetch_err:
         result_holder["error"] = f"FetchException: {fetch_err}"
 
-    result_holder["transfer_bytes"] = actual_wire_bytes
+    result_holder["transfer_bytes"] = wire_bytes
     result_holder["latency_seconds"] = round(time.time() - t0, 2)
     return result_holder
 
@@ -281,8 +218,8 @@ class NeverbounceVerifier:
                 "status": res.get("status"),
                 "flags": res.get("flags", []),
             },
-            "transfer_bytes": res.get("transfer_bytes", 11000),
-            "method": res.get("method", "prefetched_stealth_in_page"),
+            "transfer_bytes": res.get("transfer_bytes", 0),
+            "method": res.get("method", "async_stealth_in_page"),
             "error": res.get("error"),
         }
 

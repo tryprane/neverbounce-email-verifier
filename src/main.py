@@ -178,7 +178,7 @@ async def verify_batch_with_retries(
                         Actor.log.info(f"[{em:<34}] -> {st.upper():<9} ({lat}s, session: {session_id})")
                     else:
                         err = res.get("error")
-                        if attempt < max_retries and err in ("RATE_LIMITED_429", "BOT_CHALLENGE_403"):
+                        if attempt < max_retries and err in ("RATE_LIMITED_429", "BOT_CHALLENGE_403", "SESSION_TERMINATED_EARLY"):
                             still_pending.append(em)
                             Actor.log.warning(f"[{em}] hit {err} on attempt {attempt}/{max_retries}. Will retry with new session.")
                         else:

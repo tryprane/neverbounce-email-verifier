@@ -51,7 +51,7 @@ async def verify_emails_batch_async(
 ) -> List[Dict[str, Any]]:
     """
     Verifies a batch of up to 3 emails inside a single authenticated stealth browser session.
-    Fulfills PerimeterX captcha.js from RAM, aborts heavy media/trackers, and verifies in-page.
+    Uses Scrapling's native stealth session and resource pruning for ultra-low bandwidth.
     """
     clean_emails = [e.strip() for e in emails if validate_email(e)]
     if not clean_emails:
@@ -65,139 +65,99 @@ async def verify_emails_batch_async(
     if proxy_url:
         session_kwargs["proxy"] = proxy_url
 
-    t0 = time.time()
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
-            context = session.context
-            page = await context.new_page()
+            async def on_page(page):
+                # 1. Wait for PerimeterX sensor cookie
+                for _ in range(40):
+                    cookie = await page.evaluate("() => document.cookie")
+                    if "_pxhd" in cookie:
+                        break
+                    await asyncio.sleep(0.1)
 
-            # Pre-navigation route handler attached BEFORE page.goto()
-            async def route_handler(route):
-                url = route.request.url.lower()
-                # Serve captcha.js from RAM (0 external proxy transfer)
-                if "captcha.js" in url and CACHED_CAPTCHA_JS:
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_CAPTCHA_JS,
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
-                    return
-                # Abort heavy media, fonts, stylesheets, and ad trackers
-                if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
-                    t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada", "analytics"]
-                ):
-                    await route.abort()
-                else:
-                    await route.continue_()
+                await asyncio.sleep(0.5)
 
-            await page.route("**/*", route_handler)
-
-            # Fast navigation waiting for domcontentloaded
-            await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
-
-            # Wait for PerimeterX sensor cookie
-            for _ in range(40):
-                cookie = await page.evaluate("() => document.cookie")
-                if "_pxhd" in cookie:
-                    break
-                await asyncio.sleep(0.1)
-
-            await asyncio.sleep(0.4)
-
-            # In-page batch verification loop inside the active page DOM
-            js_batch_script = """
-            async (emails) => {
-                const out = [];
-                for (const em of emails) {
-                    try {
-                        const t_start = Date.now();
-                        const resp = await fetch('/api/emailcheck', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'text/plain;charset=UTF-8',
-                                'Origin': 'https://www.neverbounce.com',
-                                'Referer': 'https://www.neverbounce.com/'
-                            },
-                            body: JSON.stringify({ email: em })
-                        });
-                        const txt = await resp.text();
-                        out.push({
-                            email: em,
-                            status_code: resp.status,
-                            body: txt,
-                            latency_ms: Date.now() - t_start
-                        });
-                        if (resp.status === 403 || resp.status === 429) {
-                            break;
-                        }
-                        await new Promise(r => setTimeout(r, 600));
-                    } catch (e) {
-                        out.push({
-                            email: em,
-                            status_code: 0,
-                            body: String(e),
-                            latency_ms: 0
-                        });
+                # 2. Iterate through emails in this session
+                for idx, clean_email in enumerate(clean_emails):
+                    t_item = time.time()
+                    res_dict: Dict[str, Any] = {
+                        "email": clean_email,
+                        "success": False,
+                        "status": "unknown",
+                        "flags": [],
+                        "latency_seconds": 0.0,
+                        "transfer_bytes": 550,
+                        "method": "async_stealth_in_page",
+                        "error": None,
                     }
-                }
-                return out;
-            }
-            """
 
-            batch_eval_results = await page.evaluate(js_batch_script, clean_emails)
+                    js_script = f"""
+                    async () => {{
+                        try {{
+                            const response = await fetch('/api/emailcheck', {{
+                                method: 'POST',
+                                headers: {{
+                                    'Content-Type': 'text/plain;charset=UTF-8',
+                                    'Origin': 'https://www.neverbounce.com',
+                                    'Referer': 'https://www.neverbounce.com/'
+                                }},
+                                body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
+                            }});
+                            const status = response.status;
+                            const text = await response.text();
+                            return {{ status_code: status, body: text }};
+                        }} catch (err) {{
+                            return {{ status_code: 0, body: String(err) }};
+                        }}
+                    }}
+                    """
+                    eval_res = await page.evaluate(js_script)
+                    sc = eval_res.get("status_code", 0)
+                    body = eval_res.get("body", "")
 
-            for item in batch_eval_results:
-                em = item.get("email")
-                sc = item.get("status_code", 0)
-                body = item.get("body", "")
-                lat = round(item.get("latency_ms", 0) / 1000.0, 2)
+                    if sc == 200:
+                        try:
+                            data = json.loads(body)
+                            res_dict["success"] = True
+                            res_dict["status"] = str(data.get("status", "unknown")).lower()
+                            res_dict["flags"] = data.get("flags", [])
+                        except Exception as parse_err:
+                            res_dict["error"] = f"JSONDecodeError: {parse_err}"
+                    elif sc == 429:
+                        res_dict["error"] = "RATE_LIMITED_429"
+                    elif sc == 403:
+                        res_dict["error"] = "BOT_CHALLENGE_403"
+                    else:
+                        res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
 
-                res_dict: Dict[str, Any] = {
-                    "email": em,
-                    "success": False,
-                    "status": "unknown",
-                    "flags": [],
-                    "latency_seconds": lat,
-                    "transfer_bytes": 550,
-                    "method": "in_page_stealth_batch",
-                    "error": None,
-                }
+                    res_dict["latency_seconds"] = round(time.time() - t_item, 2)
+                    results.append(res_dict)
 
-                if sc == 200:
-                    try:
-                        data = json.loads(body)
-                        res_dict["success"] = True
-                        res_dict["status"] = str(data.get("status", "unknown")).lower()
-                        res_dict["flags"] = data.get("flags", [])
-                    except Exception as parse_err:
-                        res_dict["error"] = f"JSONDecodeError: {parse_err}"
-                elif sc == 429:
-                    res_dict["error"] = "RATE_LIMITED_429"
-                elif sc == 403:
-                    res_dict["error"] = "BOT_CHALLENGE_403"
-                else:
-                    res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
+                    if sc in (403, 429):
+                        break
 
-                results.append(res_dict)
+                    if idx < len(clean_emails) - 1:
+                        await asyncio.sleep(0.8)
 
-            await page.close()
+            await session.fetch(NEVERBOUNCE_HOME, page_action=on_page, timeout=timeout_ms)
 
     except Exception as e:
         logger.warning("Batch session exception: %s", e)
-        processed = {r["email"] for r in results}
-        for ce in clean_emails:
-            if ce not in processed:
-                results.append({
-                    "email": ce,
-                    "success": False,
-                    "status": "unknown",
-                    "flags": [],
-                    "latency_seconds": 0.0,
-                    "transfer_bytes": 0,
-                    "method": "failed",
-                    "error": f"SessionException: {e}",
-                })
+
+    # Ensure all emails have a record even if session was aborted or errored early
+    processed = {r["email"] for r in results}
+    for ce in clean_emails:
+        if ce not in processed:
+            results.append({
+                "email": ce,
+                "success": False,
+                "status": "unknown",
+                "flags": [],
+                "latency_seconds": 0.0,
+                "transfer_bytes": 0,
+                "method": "failed",
+                "error": "SESSION_TERMINATED_EARLY",
+            })
 
     return results
 

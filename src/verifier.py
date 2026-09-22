@@ -111,6 +111,10 @@ async def verify_emails_batch_async(
 
                     await asyncio.sleep(0.5)
 
+                    page_title = await page.title()
+                    cookie_names = [c["name"] for c in await context.cookies()]
+                    logger.info(f"Session State | URL: {page.url} | Title: '{page_title}' | Cookies: {cookie_names}")
+
                     # Verify all emails in this batch inside the already-open page
                     for idx, clean_email in enumerate(clean_emails):
                         t_item = time.time()
@@ -159,8 +163,10 @@ async def verify_emails_batch_async(
                                 res_dict["error"] = f"JSONDecodeError: {parse_err}"
                         elif sc == 429:
                             res_dict["error"] = "RATE_LIMITED_429"
+                            logger.warning(f"[{clean_email}] HTTP 429 body: {body[:250]}")
                         elif sc == 403:
                             res_dict["error"] = "BOT_CHALLENGE_403"
+                            logger.warning(f"[{clean_email}] HTTP 403 body: {body[:250]}")
                         else:
                             res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
 

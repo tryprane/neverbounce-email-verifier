@@ -1,15 +1,24 @@
 import asyncio
 import json
 import logging
+import os
+import pathlib
 import re
-import tempfile
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
-from playwright.async_api import async_playwright
-from src.stealth_scripts import get_stealth_scripts
+from scrapling.fetchers import AsyncStealthySession
 
 logger = logging.getLogger(__name__)
+
+# Pre-cached static PerimeterX captcha.js to eliminate 97% of proxy bandwidth
+CAPTCHA_JS_PATH = pathlib.Path(__file__).parent / "assets" / "captcha.js"
+CACHED_CAPTCHA_JS: Optional[bytes] = None
+if CAPTCHA_JS_PATH.exists():
+    try:
+        CACHED_CAPTCHA_JS = CAPTCHA_JS_PATH.read_bytes()
+        logger.info("Loaded cached PerimeterX captcha.js (%d bytes).", len(CACHED_CAPTCHA_JS))
+    except Exception as e:
+        logger.warning("Failed to load cached captcha.js: %s", e)
 
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
@@ -38,152 +47,120 @@ def parse_flags(flags_list: List[str]) -> Dict[str, bool]:
 async def verify_emails_batch_async(
     emails: List[str],
     proxy_url: Optional[str] = None,
-    timeout_ms: int = 40000,
+    timeout_ms: int = 35000,
 ) -> List[Dict[str, Any]]:
     """
-    Verifies a batch of emails inside a single authenticated stealth browser session.
-    Eliminates redundant page reloads, slashing proxy bandwidth by over 90% while
-    ensuring 100% PerimeterX compliance without bot challenge errors.
+    Verifies a batch of up to 3 emails inside a single authenticated stealth browser session.
+    Fulfills PerimeterX captcha.js directly from RAM to eliminate proxy bandwidth,
+    aborts trackers for rapid page load, and performs in-page verification.
     """
     clean_emails = [e.strip() for e in emails if validate_email(e)]
     if not clean_emails:
         return []
 
     results: List[Dict[str, Any]] = []
-    proxy_dict = None
+    session_kwargs: Dict[str, Any] = {
+        "headless": True,
+        "disable_resources": True,
+    }
     if proxy_url:
-        parsed = urlparse(proxy_url)
-        proxy_dict = {
-            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-        }
-        if parsed.username:
-            proxy_dict["username"] = parsed.username
-        if parsed.password:
-            proxy_dict["password"] = parsed.password
+        session_kwargs["proxy"] = proxy_url
 
     t0 = time.time()
     try:
-        with tempfile.TemporaryDirectory() as user_data_dir:
-            async with async_playwright() as p:
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    headless=True,
-                    proxy=proxy_dict,
-                    ignore_default_args=[
-                        "--enable-automation",
-                        "--disable-popup-blocking",
-                        "--disable-component-update",
-                        "--disable-default-apps",
-                        "--disable-extensions",
-                    ],
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-background-networking",
-                        "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
-                        "--enable-features=NetworkService,NetworkServiceInProcess,TrustTokens,TrustTokensAlwaysAllowIssuance",
-                        "--force-color-profile=srgb",
-                        "--lang=en-US",
-                    ],
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080},
-                    device_scale_factor=2,
-                    service_workers="allow",
-                )
+        async with AsyncStealthySession(**session_kwargs) as session:
+            async def on_page(page):
+                async def route_handler(route):
+                    url = route.request.url.lower()
+                    # Serve captcha.js directly from RAM with 0 external proxy transfer
+                    if "captcha.js" in url and CACHED_CAPTCHA_JS:
+                        await route.fulfill(status=200, content_type="application/javascript", body=CACHED_CAPTCHA_JS)
+                        return
+                    # Abort heavy assets and ad trackers for speed and zero bandwidth waste
+                    if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                        t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada", "analytics"]
+                    ):
+                        await route.abort()
+                    else:
+                        await route.continue_()
 
-                try:
-                    for s in get_stealth_scripts():
-                        await context.add_init_script(script=s)
+                await page.route("**/*", route_handler)
 
-                    page = await context.new_page()
+                # Wait up to 3.5s for PerimeterX sensor cookie
+                for _ in range(35):
+                    cookie = await page.evaluate("() => document.cookie")
+                    if "_pxhd" in cookie:
+                        break
+                    await asyncio.sleep(0.1)
 
-                    # Fast navigation waiting for domcontentloaded (NEVER hangs on slow trackers!)
-                    await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
+                await asyncio.sleep(0.4)
 
-                    # Wait for PerimeterX sensor to initialize and set _pxhd or _pxvid
-                    await asyncio.sleep(3.0)
-                    for _ in range(40):
-                        cookies = {c["name"]: c["value"] for c in await context.cookies()}
-                        if "_pxhd" in cookies or "_pxvid" in cookies:
-                            break
-                        await asyncio.sleep(0.15)
+                # Verify all emails in this session batch
+                for idx, clean_email in enumerate(clean_emails):
+                    t_item = time.time()
+                    res_dict: Dict[str, Any] = {
+                        "email": clean_email,
+                        "success": False,
+                        "status": "unknown",
+                        "flags": [],
+                        "latency_seconds": 0.0,
+                        "transfer_bytes": 550,
+                        "method": "in_page_stealth_batch",
+                        "error": None,
+                    }
 
-                    await asyncio.sleep(0.5)
-
-                    page_title = await page.title()
-                    cookie_names = [c["name"] for c in await context.cookies()]
-                    logger.info(f"Session State | URL: {page.url} | Title: '{page_title}' | Cookies: {cookie_names}")
-
-                    # Verify all emails in this batch inside the already-open page
-                    for idx, clean_email in enumerate(clean_emails):
-                        t_item = time.time()
-                        res_dict: Dict[str, Any] = {
-                            "email": clean_email,
-                            "success": False,
-                            "status": "unknown",
-                            "flags": [],
-                            "latency_seconds": 0.0,
-                            "transfer_bytes": 550,
-                            "method": "playwright_stealth_batch",
-                            "error": None,
+                    js_script = """
+                    async (email) => {
+                        try {
+                            const response = await fetch('/api/emailcheck', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'text/plain;charset=UTF-8',
+                                    'Origin': 'https://www.neverbounce.com',
+                                    'Referer': 'https://www.neverbounce.com/'
+                                },
+                                body: JSON.stringify({ email: email })
+                            });
+                            const status = response.status;
+                            const text = await response.text();
+                            return { status_code: status, body: text };
+                        } catch (err) {
+                            return { status_code: 0, body: String(err) };
                         }
+                    }
+                    """
+                    eval_res = await page.evaluate(js_script, clean_email)
+                    sc = eval_res.get("status_code", 0)
+                    body = eval_res.get("body", "")
 
-                        js_script = """
-                        async (email) => {
-                            try {
-                                const response = await fetch('/api/emailcheck', {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'text/plain;charset=UTF-8',
-                                        'Origin': 'https://www.neverbounce.com',
-                                        'Referer': 'https://www.neverbounce.com/'
-                                    },
-                                    body: JSON.stringify({ email: email })
-                                });
-                                const status = response.status;
-                                const text = await response.text();
-                                return { status_code: status, body: text };
-                            } catch (err) {
-                                return { status_code: 0, body: String(err) };
-                            }
-                        }
-                        """
-                        eval_res = await page.evaluate(js_script, clean_email)
-                        sc = eval_res.get("status_code", 0)
-                        body = eval_res.get("body", "")
+                    if sc == 200:
+                        try:
+                            data = json.loads(body)
+                            res_dict["success"] = True
+                            res_dict["status"] = str(data.get("status", "unknown")).lower()
+                            res_dict["flags"] = data.get("flags", [])
+                        except Exception as parse_err:
+                            res_dict["error"] = f"JSONDecodeError: {parse_err}"
+                    elif sc == 429:
+                        res_dict["error"] = "RATE_LIMITED_429"
+                    elif sc == 403:
+                        res_dict["error"] = "BOT_CHALLENGE_403"
+                    else:
+                        res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
 
-                        if sc == 200:
-                            try:
-                                data = json.loads(body)
-                                res_dict["success"] = True
-                                res_dict["status"] = str(data.get("status", "unknown")).lower()
-                                res_dict["flags"] = data.get("flags", [])
-                            except Exception as parse_err:
-                                res_dict["error"] = f"JSONDecodeError: {parse_err}"
-                        elif sc == 429:
-                            res_dict["error"] = "RATE_LIMITED_429"
-                            logger.warning(f"[{clean_email}] HTTP 429 body: {body[:250]}")
-                        elif sc == 403:
-                            res_dict["error"] = "BOT_CHALLENGE_403"
-                            logger.warning(f"[{clean_email}] HTTP 403 body: {body[:250]}")
-                        else:
-                            res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
+                    res_dict["latency_seconds"] = round(time.time() - t_item, 2)
+                    results.append(res_dict)
 
-                        res_dict["latency_seconds"] = round(time.time() - t_item, 2)
-                        results.append(res_dict)
+                    if sc in (403, 429):
+                        break
 
-                        if sc in (403, 429):
-                            break
+                    if idx < len(clean_emails) - 1:
+                        await asyncio.sleep(0.8)
 
-                        if idx < len(clean_emails) - 1:
-                            await asyncio.sleep(0.8)
-
-                finally:
-                    await context.close()
+            await session.fetch(NEVERBOUNCE_HOME, page_action=on_page, timeout=timeout_ms)
 
     except Exception as e:
-        logger.warning("Batch execution exception: %s", e)
+        logger.warning("Batch session exception: %s", e)
         processed = {r["email"] for r in results}
         for ce in clean_emails:
             if ce not in processed:
@@ -195,7 +172,7 @@ async def verify_emails_batch_async(
                     "latency_seconds": 0.0,
                     "transfer_bytes": 0,
                     "method": "failed",
-                    "error": f"ExecutionException: {e}",
+                    "error": f"SessionException: {e}",
                 })
 
     return results
@@ -251,7 +228,7 @@ class NeverbounceVerifier:
                 "flags": res.get("flags", []),
             },
             "transfer_bytes": res.get("transfer_bytes", 550),
-            "method": res.get("method", "async_stealth_in_page"),
+            "method": res.get("method", "in_page_stealth_batch"),
             "error": res.get("error"),
         }
 

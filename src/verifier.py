@@ -68,10 +68,14 @@ async def verify_emails_batch_async(
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
             async def on_page(page):
+                title = await page.title()
+                cookie = await page.evaluate("() => document.cookie")
+                logger.info("Page loaded: title='%s', url='%s', cookies='%s'", title, page.url, cookie)
+
                 # 1. Wait for PerimeterX sensor cookie
                 for _ in range(40):
-                    cookie = await page.evaluate("() => document.cookie")
-                    if "_pxhd" in cookie:
+                    c = await page.evaluate("() => document.cookie")
+                    if "_pxhd" in c or "_px3" in c:
                         break
                     await asyncio.sleep(0.1)
 
@@ -124,11 +128,14 @@ async def verify_emails_batch_async(
                         except Exception as parse_err:
                             res_dict["error"] = f"JSONDecodeError: {parse_err}"
                     elif sc == 429:
-                        res_dict["error"] = "RATE_LIMITED_429"
+                        res_dict["error"] = f"RATE_LIMITED_429: {body[:100]}"
+                        logger.warning("[%s] hit 429: %s", clean_email, body[:200])
                     elif sc == 403:
-                        res_dict["error"] = "BOT_CHALLENGE_403"
+                        res_dict["error"] = f"BOT_CHALLENGE_403: {body[:100]}"
+                        logger.warning("[%s] hit 403: %s", clean_email, body[:300])
                     else:
-                        res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
+                        res_dict["error"] = f"HTTP_{sc}: {body[:100]}"
+                        logger.warning("[%s] hit HTTP_%d: %s", clean_email, sc, body[:200])
 
                     res_dict["latency_seconds"] = round(time.time() - t_item, 2)
                     results.append(res_dict)
@@ -139,7 +146,7 @@ async def verify_emails_batch_async(
                     if idx < len(clean_emails) - 1:
                         await asyncio.sleep(0.8)
 
-            await session.fetch(NEVERBOUNCE_HOME, page_action=on_page, timeout=timeout_ms)
+            await session.fetch(NEVERBOUNCE_HOME, page_action=on_page, solve_cloudflare=True, timeout=timeout_ms)
 
     except Exception as e:
         logger.warning("Batch session exception: %s", e)

@@ -4,7 +4,9 @@ import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
-from scrapling.fetchers import AsyncStealthySession
+from urllib.parse import urlparse
+from playwright.async_api import async_playwright
+from scrapling.engines._browsers._stealth import _compiled_stealth_scripts
 
 logger = logging.getLogger(__name__)
 
@@ -47,35 +49,56 @@ async def verify_emails_batch_async(
         return []
 
     results: List[Dict[str, Any]] = []
-    session_kwargs: Dict[str, Any] = {
-        "headless": True,
-        "disable_resources": True,
-    }
+    proxy_dict = None
     if proxy_url:
-        session_kwargs["proxy"] = proxy_url
+        parsed = urlparse(proxy_url)
+        proxy_dict = {
+            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+        }
+        if parsed.username:
+            proxy_dict["username"] = parsed.username
+        if parsed.password:
+            proxy_dict["password"] = parsed.password
 
     t0 = time.time()
     try:
-        async with AsyncStealthySession(**session_kwargs) as session:
-            async def on_page(page):
-                # 1. Dwell time: wait for page scripts & PerimeterX sensor to execute
-                await asyncio.sleep(3.5)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-background-networking",
+                ],
+            )
 
-                # 2. Wait up to 5s for PerimeterX sensor to set _pxhd cookie
-                t_start = time.time()
-                while time.time() - t_start < 5.0:
-                    try:
-                        has_cookie = await page.evaluate("() => document.cookie.includes('_pxhd')")
-                        if has_cookie:
-                            break
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.2)
+            try:
+                context = await browser.new_context(
+                    proxy=proxy_dict,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                )
 
-                # Small human typing dwell
-                await asyncio.sleep(0.6)
+                for s in _compiled_stealth_scripts():
+                    await context.add_init_script(script=s)
 
-                # 3. Iterate through emails in this session
+                page = await context.new_page()
+
+                # Fast navigation waiting for domcontentloaded (NEVER hangs on slow trackers!)
+                await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
+
+                # Wait for PerimeterX sensor to initialize and set _pxhd or _pxvid
+                await asyncio.sleep(2.5)
+                for _ in range(35):
+                    cookies = {c["name"]: c["value"] for c in await context.cookies()}
+                    if "_pxhd" in cookies or "_pxvid" in cookies:
+                        break
+                    await asyncio.sleep(0.15)
+
+                await asyncio.sleep(0.5)
+
+                # Verify all emails in this batch inside the already-open page
                 for idx, clean_email in enumerate(clean_emails):
                     t_item = time.time()
                     res_dict: Dict[str, Any] = {
@@ -85,31 +108,31 @@ async def verify_emails_batch_async(
                         "flags": [],
                         "latency_seconds": 0.0,
                         "transfer_bytes": 550,
-                        "method": "async_stealth_in_page",
+                        "method": "playwright_stealth_batch",
                         "error": None,
                     }
 
-                    js_script = f"""
-                    async () => {{
-                        try {{
-                            const response = await fetch('/api/emailcheck', {{
+                    js_script = """
+                    async (email) => {
+                        try {
+                            const response = await fetch('/api/emailcheck', {
                                 method: 'POST',
-                                headers: {{
+                                headers: {
                                     'Content-Type': 'text/plain;charset=UTF-8',
                                     'Origin': 'https://www.neverbounce.com',
                                     'Referer': 'https://www.neverbounce.com/'
-                                }},
-                                body: JSON.stringify({{ email: {json.dumps(clean_email)} }})
-                            }});
+                                },
+                                body: JSON.stringify({ email: email })
+                            });
                             const status = response.status;
                             const text = await response.text();
-                            return {{ status_code: status, body: text }};
-                        }} catch (err) {{
-                            return {{ status_code: 0, body: String(err) }};
-                        }}
-                    }}
+                            return { status_code: status, body: text };
+                        } catch (err) {
+                            return { status_code: 0, body: String(err) };
+                        }
+                    }
                     """
-                    eval_res = await page.evaluate(js_script)
+                    eval_res = await page.evaluate(js_script, clean_email)
                     sc = eval_res.get("status_code", 0)
                     body = eval_res.get("body", "")
 
@@ -132,16 +155,16 @@ async def verify_emails_batch_async(
                     results.append(res_dict)
 
                     if sc in (403, 429):
-                        # Stop remaining in this batch so caller can rotate IP
                         break
 
                     if idx < len(clean_emails) - 1:
                         await asyncio.sleep(0.8)
 
-            await session.fetch(NEVERBOUNCE_HOME, page_action=on_page, timeout=timeout_ms)
+            finally:
+                await browser.close()
 
     except Exception as e:
-        logger.warning("Batch session exception: %s", e)
+        logger.warning("Batch execution exception: %s", e)
         processed = {r["email"] for r in results}
         for ce in clean_emails:
             if ce not in processed:
@@ -153,7 +176,7 @@ async def verify_emails_batch_async(
                     "latency_seconds": 0.0,
                     "transfer_bytes": 0,
                     "method": "failed",
-                    "error": f"SessionException: {e}",
+                    "error": f"ExecutionException: {e}",
                 })
 
     return results

@@ -260,15 +260,20 @@ async def main():
         # Initialize Apify Proxy if custom proxies not provided
         if not custom_proxies:
             try:
-                if proxy_input:
-                    apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
-                else:
+                groups = (proxy_input or {}).get("apifyProxyGroups") if proxy_input else None
+                if not groups:
                     try:
                         apify_proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"])
-                        Actor.log.info("Initialized Apify Residential Proxy pool.")
-                    except Exception:
-                        apify_proxy_config = await Actor.create_proxy_configuration()
-                        Actor.log.info("Initialized Apify Standard/Datacenter Proxy pool.")
+                        Actor.log.info("Initialized Apify Residential Proxy pool (RESIDENTIAL group).")
+                    except Exception as res_err:
+                        Actor.log.warning(f"Could not init residential proxy: {res_err}, falling back to standard proxy.")
+                        if proxy_input:
+                            apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+                        else:
+                            apify_proxy_config = await Actor.create_proxy_configuration()
+                else:
+                    apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+                    Actor.log.info(f"Initialized Apify Proxy with groups: {groups}")
             except Exception as proxy_err:
                 Actor.log.warning(f"Could not initialize Apify proxy: {proxy_err}. Running in direct mode.")
 

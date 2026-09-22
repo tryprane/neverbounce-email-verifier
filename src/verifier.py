@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
-from scrapling.engines._browsers._stealth import _compiled_stealth_scripts
+from src.stealth_scripts import get_stealth_scripts
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ async def verify_emails_batch_async(
                     viewport={"width": 1920, "height": 1080},
                 )
 
-                for s in _compiled_stealth_scripts():
+                for s in get_stealth_scripts():
                     await context.add_init_script(script=s)
 
                 page = await context.new_page()

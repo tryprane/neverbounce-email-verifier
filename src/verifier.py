@@ -35,7 +35,7 @@ def parse_flags(flags_list: List[str]) -> Dict[str, bool]:
 async def verify_emails_batch_async(
     emails: List[str],
     proxy_url: Optional[str] = None,
-    timeout_ms: int = 35000,
+    timeout_ms: int = 40000,
 ) -> List[Dict[str, Any]]:
     """
     Verifies a batch of emails inside a single authenticated stealth browser session.
@@ -58,17 +58,24 @@ async def verify_emails_batch_async(
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
             async def on_page(page):
-                # 1. Wait for PerimeterX sensor to initialize and set _pxhd cookie
-                for _ in range(40):
-                    cookie = await page.evaluate("() => document.cookie")
-                    if "_pxhd" in cookie:
-                        break
-                    await asyncio.sleep(0.1)
+                # 1. Dwell time: wait for page scripts & PerimeterX sensor to execute
+                await asyncio.sleep(3.5)
 
-                # Short stabilization pause
-                await asyncio.sleep(0.5)
+                # 2. Wait up to 5s for PerimeterX sensor to set _pxhd cookie
+                t_start = time.time()
+                while time.time() - t_start < 5.0:
+                    try:
+                        has_cookie = await page.evaluate("() => document.cookie.includes('_pxhd')")
+                        if has_cookie:
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.2)
 
-                # 2. Iterate through emails in this session
+                # Small human typing dwell
+                await asyncio.sleep(0.6)
+
+                # 3. Iterate through emails in this session
                 for idx, clean_email in enumerate(clean_emails):
                     t_item = time.time()
                     res_dict: Dict[str, Any] = {

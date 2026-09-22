@@ -10,15 +10,7 @@ from scrapling.fetchers import AsyncStealthySession
 
 logger = logging.getLogger(__name__)
 
-# Pre-cached static PerimeterX captcha.js to eliminate proxy bandwidth
-CAPTCHA_JS_PATH = pathlib.Path(__file__).parent / "assets" / "captcha.js"
-CACHED_CAPTCHA_JS: Optional[bytes] = None
-if CAPTCHA_JS_PATH.exists():
-    try:
-        CACHED_CAPTCHA_JS = CAPTCHA_JS_PATH.read_bytes()
-        logger.info("Loaded cached PerimeterX captcha.js (%d bytes).", len(CACHED_CAPTCHA_JS))
-    except Exception as e:
-        logger.warning("Failed to load cached captcha.js: %s", e)
+STEALTH_INIT_JS_PATH = pathlib.Path(__file__).parent / "assets" / "stealth_init.js"
 
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
@@ -51,7 +43,7 @@ async def verify_emails_batch_async(
 ) -> List[Dict[str, Any]]:
     """
     Verifies a batch of up to 3 emails inside a single authenticated stealth browser session.
-    Uses Scrapling's native stealth session and resource pruning for ultra-low bandwidth.
+    Uses Scrapling's native stealth session, WebGL hardware spoofing, and resource pruning.
     """
     clean_emails = [e.strip() for e in emails if validate_email(e)]
     if not clean_emails:
@@ -62,6 +54,8 @@ async def verify_emails_batch_async(
         "headless": True,
         "disable_resources": True,
     }
+    if STEALTH_INIT_JS_PATH.exists():
+        session_kwargs["init_script"] = str(STEALTH_INIT_JS_PATH)
     if proxy_url:
         session_kwargs["proxy"] = proxy_url
 
@@ -72,14 +66,26 @@ async def verify_emails_batch_async(
                 cookie = await page.evaluate("() => document.cookie")
                 logger.info("Page loaded: title='%s', url='%s', cookies='%s'", title, page.url, cookie)
 
-                # 1. Wait for PerimeterX sensor cookie
-                for _ in range(40):
+                # Simulate human mouse exploration and input field focus
+                try:
+                    await page.mouse.move(180, 240)
+                    await asyncio.sleep(0.1)
+                    await page.mouse.move(420, 390)
+                    await asyncio.sleep(0.15)
+                    input_box = page.locator('input[name="verifyEmail"]').first
+                    if await input_box.is_visible():
+                        await input_box.click()
+                except Exception as e:
+                    logger.debug("Mouse interaction skipped: %s", e)
+
+                # Wait for PerimeterX sensor cookie
+                for _ in range(30):
                     c = await page.evaluate("() => document.cookie")
                     if "_pxhd" in c or "_px3" in c:
                         break
                     await asyncio.sleep(0.1)
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.6)
 
                 # 2. Iterate through emails in this session
                 for idx, clean_email in enumerate(clean_emails):

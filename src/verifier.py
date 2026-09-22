@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import tempfile
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -62,106 +63,118 @@ async def verify_emails_batch_async(
 
     t0 = time.time()
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-background-networking",
-                ],
-            )
-
-            try:
-                context = await browser.new_context(
+        with tempfile.TemporaryDirectory() as user_data_dir:
+            async with async_playwright() as p:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=True,
                     proxy=proxy_dict,
+                    ignore_default_args=[
+                        "--enable-automation",
+                        "--disable-popup-blocking",
+                        "--disable-component-update",
+                        "--disable-default-apps",
+                        "--disable-extensions",
+                    ],
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-background-networking",
+                        "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
+                        "--enable-features=NetworkService,NetworkServiceInProcess,TrustTokens,TrustTokensAlwaysAllowIssuance",
+                        "--force-color-profile=srgb",
+                        "--lang=en-US",
+                    ],
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
                     viewport={"width": 1920, "height": 1080},
+                    device_scale_factor=2,
+                    service_workers="allow",
                 )
 
-                for s in get_stealth_scripts():
-                    await context.add_init_script(script=s)
+                try:
+                    for s in get_stealth_scripts():
+                        await context.add_init_script(script=s)
 
-                page = await context.new_page()
+                    page = await context.new_page()
 
-                # Fast navigation waiting for domcontentloaded (NEVER hangs on slow trackers!)
-                await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
+                    # Fast navigation waiting for domcontentloaded (NEVER hangs on slow trackers!)
+                    await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
 
-                # Wait for PerimeterX sensor to initialize and set _pxhd or _pxvid
-                await asyncio.sleep(2.5)
-                for _ in range(35):
-                    cookies = {c["name"]: c["value"] for c in await context.cookies()}
-                    if "_pxhd" in cookies or "_pxvid" in cookies:
-                        break
-                    await asyncio.sleep(0.15)
+                    # Wait for PerimeterX sensor to initialize and set _pxhd or _pxvid
+                    await asyncio.sleep(3.0)
+                    for _ in range(40):
+                        cookies = {c["name"]: c["value"] for c in await context.cookies()}
+                        if "_pxhd" in cookies or "_pxvid" in cookies:
+                            break
+                        await asyncio.sleep(0.15)
 
-                await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5)
 
-                # Verify all emails in this batch inside the already-open page
-                for idx, clean_email in enumerate(clean_emails):
-                    t_item = time.time()
-                    res_dict: Dict[str, Any] = {
-                        "email": clean_email,
-                        "success": False,
-                        "status": "unknown",
-                        "flags": [],
-                        "latency_seconds": 0.0,
-                        "transfer_bytes": 550,
-                        "method": "playwright_stealth_batch",
-                        "error": None,
-                    }
-
-                    js_script = """
-                    async (email) => {
-                        try {
-                            const response = await fetch('/api/emailcheck', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'text/plain;charset=UTF-8',
-                                    'Origin': 'https://www.neverbounce.com',
-                                    'Referer': 'https://www.neverbounce.com/'
-                                },
-                                body: JSON.stringify({ email: email })
-                            });
-                            const status = response.status;
-                            const text = await response.text();
-                            return { status_code: status, body: text };
-                        } catch (err) {
-                            return { status_code: 0, body: String(err) };
+                    # Verify all emails in this batch inside the already-open page
+                    for idx, clean_email in enumerate(clean_emails):
+                        t_item = time.time()
+                        res_dict: Dict[str, Any] = {
+                            "email": clean_email,
+                            "success": False,
+                            "status": "unknown",
+                            "flags": [],
+                            "latency_seconds": 0.0,
+                            "transfer_bytes": 550,
+                            "method": "playwright_stealth_batch",
+                            "error": None,
                         }
-                    }
-                    """
-                    eval_res = await page.evaluate(js_script, clean_email)
-                    sc = eval_res.get("status_code", 0)
-                    body = eval_res.get("body", "")
 
-                    if sc == 200:
-                        try:
-                            data = json.loads(body)
-                            res_dict["success"] = True
-                            res_dict["status"] = str(data.get("status", "unknown")).lower()
-                            res_dict["flags"] = data.get("flags", [])
-                        except Exception as parse_err:
-                            res_dict["error"] = f"JSONDecodeError: {parse_err}"
-                    elif sc == 429:
-                        res_dict["error"] = "RATE_LIMITED_429"
-                    elif sc == 403:
-                        res_dict["error"] = "BOT_CHALLENGE_403"
-                    else:
-                        res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
+                        js_script = """
+                        async (email) => {
+                            try {
+                                const response = await fetch('/api/emailcheck', {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'text/plain;charset=UTF-8',
+                                        'Origin': 'https://www.neverbounce.com',
+                                        'Referer': 'https://www.neverbounce.com/'
+                                    },
+                                    body: JSON.stringify({ email: email })
+                                });
+                                const status = response.status;
+                                const text = await response.text();
+                                return { status_code: status, body: text };
+                            } catch (err) {
+                                return { status_code: 0, body: String(err) };
+                            }
+                        }
+                        """
+                        eval_res = await page.evaluate(js_script, clean_email)
+                        sc = eval_res.get("status_code", 0)
+                        body = eval_res.get("body", "")
 
-                    res_dict["latency_seconds"] = round(time.time() - t_item, 2)
-                    results.append(res_dict)
+                        if sc == 200:
+                            try:
+                                data = json.loads(body)
+                                res_dict["success"] = True
+                                res_dict["status"] = str(data.get("status", "unknown")).lower()
+                                res_dict["flags"] = data.get("flags", [])
+                            except Exception as parse_err:
+                                res_dict["error"] = f"JSONDecodeError: {parse_err}"
+                        elif sc == 429:
+                            res_dict["error"] = "RATE_LIMITED_429"
+                        elif sc == 403:
+                            res_dict["error"] = "BOT_CHALLENGE_403"
+                        else:
+                            res_dict["error"] = f"HTTP_{sc}: {body[:60]}"
 
-                    if sc in (403, 429):
-                        break
+                        res_dict["latency_seconds"] = round(time.time() - t_item, 2)
+                        results.append(res_dict)
 
-                    if idx < len(clean_emails) - 1:
-                        await asyncio.sleep(0.8)
+                        if sc in (403, 429):
+                            break
 
-            finally:
-                await browser.close()
+                        if idx < len(clean_emails) - 1:
+                            await asyncio.sleep(0.8)
+
+                finally:
+                    await context.close()
 
     except Exception as e:
         logger.warning("Batch execution exception: %s", e)

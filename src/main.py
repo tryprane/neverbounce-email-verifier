@@ -260,21 +260,18 @@ async def main():
         # Initialize Apify Proxy if custom proxies not provided
         if not custom_proxies:
             try:
-                groups = (proxy_input or {}).get("apifyProxyGroups") if proxy_input else None
-                country = (proxy_input or {}).get("apifyProxyCountry") if proxy_input else None
-                if not groups:
+                if proxy_input:
+                    if "apifyProxyCountry" not in proxy_input:
+                        proxy_input["apifyProxyCountry"] = "US"
+                    apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+                    Actor.log.info(f"Initialized Apify Proxy with input: {proxy_input}")
+                else:
                     try:
-                        apify_proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"], country_code=country or "US")
+                        apify_proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"], country_code="US")
                         Actor.log.info("Initialized Apify Residential Proxy pool (RESIDENTIAL group, US geo).")
                     except Exception as res_err:
                         Actor.log.warning(f"Could not init residential proxy: {res_err}, falling back to standard proxy.")
-                        if proxy_input:
-                            apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
-                        else:
-                            apify_proxy_config = await Actor.create_proxy_configuration()
-                else:
-                    apify_proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
-                    Actor.log.info(f"Initialized Apify Proxy with input: {proxy_input}")
+                        apify_proxy_config = await Actor.create_proxy_configuration()
             except Exception as proxy_err:
                 Actor.log.warning(f"Could not initialize Apify proxy: {proxy_err}. Running in direct mode.")
 

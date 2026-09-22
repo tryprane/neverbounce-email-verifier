@@ -20,9 +20,6 @@ if CAPTCHA_JS_PATH.exists():
     except Exception as e:
         logger.warning("Failed to load cached captcha.js: %s", e)
 
-# PX sensor script cached in RAM across sessions
-CACHED_PX_SENSOR: Optional[bytes] = None
-
 NEVERBOUNCE_HOME = "https://www.neverbounce.com/"
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
@@ -50,15 +47,12 @@ def parse_flags(flags_list: List[str]) -> Dict[str, bool]:
 async def verify_emails_batch_async(
     emails: List[str],
     proxy_url: Optional[str] = None,
-    timeout_ms: int = 35000,
+    timeout_ms: int = 40000,
 ) -> List[Dict[str, Any]]:
     """
     Verifies a batch of up to 3 emails inside a single authenticated stealth browser session.
-    Uses commit 20b1c54 pre-goto route whitelisting + wait_until='commit' + RAM fulfillment
-    to achieve 99% proxy bandwidth reduction and 100% PerimeterX compliance.
+    Fulfills PerimeterX captcha.js from RAM, aborts heavy media/trackers, and verifies in-page.
     """
-    global CACHED_PX_SENSOR
-
     clean_emails = [e.strip() for e in emails if validate_email(e)]
     if not clean_emails:
         return []
@@ -72,20 +66,15 @@ async def verify_emails_batch_async(
         session_kwargs["proxy"] = proxy_url
 
     t0 = time.time()
-    wire_bytes = 0
-
     try:
         async with AsyncStealthySession(**session_kwargs) as session:
             context = session.context
             page = await context.new_page()
 
-            # Pre-navigation route whitelist attached BEFORE page.goto()
+            # Pre-navigation route handler attached BEFORE page.goto()
             async def route_handler(route):
-                global CACHED_PX_SENSOR
                 url = route.request.url.lower()
-                rtype = route.request.resource_type
-
-                # 1. Fulfill captcha.js from RAM
+                # Serve captcha.js from RAM (0 external proxy transfer)
                 if "captcha.js" in url and CACHED_CAPTCHA_JS:
                     await route.fulfill(
                         status=200,
@@ -94,65 +83,35 @@ async def verify_emails_batch_async(
                         headers={"Access-Control-Allow-Origin": "*"},
                     )
                     return
-
-                # 2. Fulfill PX sensor from RAM if previously cached
-                if "/px.js" in url and CACHED_PX_SENSOR:
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript",
-                        body=CACHED_PX_SENSOR,
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
-                    return
-
-                # 3. Whitelist: Only allow NeverBounce main document, PerimeterX endpoints, and emailcheck
-                is_main_doc = rtype == "document" and "neverbounce.com" in url
-                is_emailcheck = "/api/emailcheck" in url
-                is_px_endpoint = any(k in url for k in [
-                    "/btfn1q7w/",
-                    "/px/",
-                    "/b/s/",
-                    "collector-px",
-                    "client.perimeterx.net",
-                    "px-cloud.net",
-                    "/px.js",
-                ])
-
-                if is_main_doc or is_emailcheck or is_px_endpoint:
-                    await route.continue_()
-                else:
+                # Abort heavy media, fonts, stylesheets, and ad trackers
+                if route.request.resource_type in ["image", "media", "font", "stylesheet"] or any(
+                    t in url for t in ["facebook", "googleads", "zoominfo", "datadog", "ada", "analytics"]
+                ):
                     await route.abort()
+                else:
+                    await route.continue_()
 
             await page.route("**/*", route_handler)
 
-            # Cache PX sensor on first live download
-            async def on_response_cache(resp):
-                global CACHED_PX_SENSOR
-                if CACHED_PX_SENSOR is None and "/px.js" in resp.url.lower():
-                    try:
-                        b = await resp.body()
-                        if len(b) > 1000:
-                            CACHED_PX_SENSOR = b
-                            logger.info("Cached PX sensor script (%d bytes) in RAM.", len(b))
-                    except Exception:
-                        pass
+            # Fast navigation waiting for domcontentloaded
+            await page.goto(NEVERBOUNCE_HOME, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            page.on("response", on_response_cache)
+            # Wait for PerimeterX sensor cookie
+            for _ in range(40):
+                cookie = await page.evaluate("() => document.cookie")
+                if "_pxhd" in cookie:
+                    break
+                await asyncio.sleep(0.1)
 
-            # Instant commit navigation (never hangs on slow third-party trackers!)
-            await page.goto(NEVERBOUNCE_HOME, wait_until="commit", timeout=timeout_ms)
+            await asyncio.sleep(0.4)
 
-            # In-page batch verification loop inside the authenticated page DOM
+            # In-page batch verification loop inside the active page DOM
             js_batch_script = """
             async (emails) => {
-                const start = Date.now();
-                while (!document.cookie.includes('_pxhd') && (Date.now() - start < 6000)) {
-                    await new Promise(r => setTimeout(r, 100));
-                }
                 const out = [];
                 for (const em of emails) {
                     try {
-                        const t0 = Date.now();
+                        const t_start = Date.now();
                         const resp = await fetch('/api/emailcheck', {
                             method: 'POST',
                             headers: {
@@ -167,7 +126,7 @@ async def verify_emails_batch_async(
                             email: em,
                             status_code: resp.status,
                             body: txt,
-                            latency_ms: Date.now() - t0
+                            latency_ms: Date.now() - t_start
                         });
                         if (resp.status === 403 || resp.status === 429) {
                             break;
@@ -201,7 +160,7 @@ async def verify_emails_batch_async(
                     "flags": [],
                     "latency_seconds": lat,
                     "transfer_bytes": 550,
-                    "method": "whitelist_stealth_batch",
+                    "method": "in_page_stealth_batch",
                     "error": None,
                 }
 
@@ -293,7 +252,7 @@ class NeverbounceVerifier:
                 "flags": res.get("flags", []),
             },
             "transfer_bytes": res.get("transfer_bytes", 550),
-            "method": res.get("method", "whitelist_stealth_batch"),
+            "method": res.get("method", "in_page_stealth_batch"),
             "error": res.get("error"),
         }
 
